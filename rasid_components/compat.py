@@ -48,9 +48,11 @@ IMPORTANT RULES
 4. ``exec_dialog()`` below still branches on version because the method name
    itself differs (Qt5 ``exec_()`` vs Qt6 ``exec()``); that is not an enum.
 """
-from qgis.PyQt.QtCore import QT_VERSION, Qt
-from qgis.PyQt.QtGui import QColor, QPainter
-from qgis.PyQt.QtWidgets import QFrame, QLineEdit, QMessageBox, QDialog, QSizePolicy
+from qgis.PyQt.QtCore import QT_VERSION, QEvent, Qt, QEasingCurve
+from qgis.PyQt.QtGui import QColor, QIcon, QPainter
+from qgis.PyQt.QtWidgets import (
+    QDialog, QDockWidget, QFrame, QLineEdit, QMessageBox, QSizePolicy,
+)
 
 QT6 = QT_VERSION >= 0x060000
 
@@ -143,9 +145,20 @@ QDialog_Rejected             = QDialog.DialogCode.Rejected
 Qt_Tool                      = Qt.WindowType.Tool
 Qt_FramelessWindowHint       = Qt.WindowType.FramelessWindowHint
 Qt_WA_TranslucentBackground  = Qt.WidgetAttribute.WA_TranslucentBackground
+# Without this, a stylesheet `background` on a plain QWidget SUBCLASS is
+# silently ignored — Qt only honours it for QFrame-derived widgets or when the
+# attribute is set explicitly. See widgets.paint_background.
+Qt_WA_StyledBackground       = Qt.WidgetAttribute.WA_StyledBackground
 
 # Pen styles
 Qt_SolidLine                 = Qt.PenStyle.SolidLine
+
+# Keyboard modifiers — the composer distinguishes Enter, Shift+Enter and
+# Ctrl+Enter, which decide between sending and inserting a newline.
+Qt_ShiftModifier             = Qt.KeyboardModifier.ShiftModifier
+Qt_ControlModifier           = Qt.KeyboardModifier.ControlModifier
+Qt_AltModifier               = Qt.KeyboardModifier.AltModifier
+Qt_NoModifier                = Qt.KeyboardModifier.NoModifier
 
 # Keyboard keys
 Qt_Key_Escape                = Qt.Key.Key_Escape
@@ -160,11 +173,59 @@ QSizePolicy_Preferred        = QSizePolicy.Policy.Preferred
 QSizePolicy_Fixed            = QSizePolicy.Policy.Fixed
 QSizePolicy_Minimum          = QSizePolicy.Policy.Minimum
 QSizePolicy_Maximum          = QSizePolicy.Policy.Maximum
+# Ignored lets a label shrink below its own text width, which is what allows
+# an elided title to narrow with the dock instead of pinning it open.
+QSizePolicy_Ignored          = QSizePolicy.Policy.Ignored
+QSizePolicy_MinimumExpanding = QSizePolicy.Policy.MinimumExpanding
+
+# Pen caps / joins — the icon set strokes every path with round ends, which is
+# what gives it its family resemblance to the SaaS's lucide icons.
+Qt_RoundCap                  = Qt.PenCapStyle.RoundCap
+Qt_FlatCap                   = Qt.PenCapStyle.FlatCap
+Qt_RoundJoin                 = Qt.PenJoinStyle.RoundJoin
+Qt_NoPen                     = Qt.PenStyle.NoPen
+Qt_NoBrush                   = Qt.BrushStyle.NoBrush
+Qt_SolidPattern              = Qt.BrushStyle.SolidPattern
+
+# QIcon modes/states — used to register the disabled and active tints of a
+# painted icon so a button dims and highlights without the caller swapping it.
+QIcon_Normal                 = QIcon.Mode.Normal
+QIcon_Disabled               = QIcon.Mode.Disabled
+QIcon_Active                 = QIcon.Mode.Active
+QIcon_Selected               = QIcon.Mode.Selected
+QIcon_Off                    = QIcon.State.Off
+QIcon_On                     = QIcon.State.On
+
+# Easing — the toggle switch's knob travel.
+QEasingCurve_OutCubic        = QEasingCurve.Type.OutCubic
+
+# Dock widget areas and features. The GoPilot panel docks right by default and
+# must stay dockable/floatable/closable, which is the default set minus the
+# vertical-title option.
+Qt_RightDockWidgetArea       = Qt.DockWidgetArea.RightDockWidgetArea
+Qt_LeftDockWidgetArea        = Qt.DockWidgetArea.LeftDockWidgetArea
+Qt_BottomDockWidgetArea      = Qt.DockWidgetArea.BottomDockWidgetArea
+Qt_AllDockWidgetAreas        = Qt.DockWidgetArea.AllDockWidgetAreas
+QDockWidget_Movable          = QDockWidget.DockWidgetFeature.DockWidgetMovable
+QDockWidget_Floatable        = QDockWidget.DockWidgetFeature.DockWidgetFloatable
+QDockWidget_Closable         = QDockWidget.DockWidgetFeature.DockWidgetClosable
+
+# Text elide. Right for a chat title; Middle for a filesystem path, where the
+# drive and the leaf folder are the informative ends and the middle is not.
+Qt_ElideRight                = Qt.TextElideMode.ElideRight
+Qt_ElideMiddle               = Qt.TextElideMode.ElideMiddle
+Qt_ElideLeft                 = Qt.TextElideMode.ElideLeft
 
 # Misc
 Qt_KeepAspectRatio           = Qt.AspectRatioMode.KeepAspectRatio
+# "Cover" rather than "contain": scale until the box is filled on BOTH axes and
+# let the overflow be cropped. See image_loader.load_image.
+Qt_KeepAspectRatioByExpanding = Qt.AspectRatioMode.KeepAspectRatioByExpanding
+Qt_IgnoreAspectRatio         = Qt.AspectRatioMode.IgnoreAspectRatio
 Qt_SmoothTransformation      = Qt.TransformationMode.SmoothTransformation
 Qt_ScrollBarAlwaysOff        = Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+Qt_ScrollBarAlwaysOn         = Qt.ScrollBarPolicy.ScrollBarAlwaysOn
+Qt_ScrollBarAsNeeded         = Qt.ScrollBarPolicy.ScrollBarAsNeeded
 Qt_WaitCursor                = Qt.CursorShape.WaitCursor
 Qt_ArrowCursor               = Qt.CursorShape.ArrowCursor
 Qt_PointingHandCursor        = Qt.CursorShape.PointingHandCursor
@@ -174,3 +235,40 @@ Qt_RichText                  = Qt.TextFormat.RichText
 Qt_PlainText                 = Qt.TextFormat.PlainText
 Qt_TextBrowserInteraction    = Qt.TextInteractionFlag.TextBrowserInteraction
 Qt_transparent               = Qt.GlobalColor.transparent
+Qt_SizeAllCursor             = Qt.CursorShape.SizeAllCursor
+# Edge and corner cursors for the frameless panel's own resize zones.
+Qt_SizeHorCursor             = Qt.CursorShape.SizeHorCursor
+Qt_SizeVerCursor             = Qt.CursorShape.SizeVerCursor
+Qt_SizeBDiagCursor           = Qt.CursorShape.SizeBDiagCursor
+Qt_SizeFDiagCursor           = Qt.CursorShape.SizeFDiagCursor
+
+# Event types, for the drag filter in window_drag.py
+QEvent_MouseButtonPress      = QEvent.Type.MouseButtonPress
+QEvent_MouseButtonRelease    = QEvent.Type.MouseButtonRelease
+QEvent_MouseButtonDblClick   = QEvent.Type.MouseButtonDblClick
+QEvent_MouseMove             = QEvent.Type.MouseMove
+QEvent_Enter                 = QEvent.Type.Enter
+QEvent_Leave                 = QEvent.Type.Leave
+
+# Keeps the OS resize border while dropping the caption; see
+# gopilot_dock._apply_floating_chrome for the measurements behind that.
+Qt_CustomizeWindowHint       = Qt.WindowType.CustomizeWindowHint
+
+
+def mouse_global_pos(event):
+    """The screen position of a mouse event, as a ``QPoint``.
+
+    Another renamed method rather than a moved enum, so it needs a branch like
+    ``exec_dialog``: Qt5's ``globalPos()`` was replaced in Qt6 by
+    ``globalPosition()``, which returns a ``QPointF``. Qt6 keeps ``globalPos()``
+    only as a deprecated alias on some event classes, so prefer the new name
+    and fall back.
+
+    Used by the frameless floating panel to drag its own window — with no OS
+    caption there is nothing for Windows to drag by, so the move arithmetic is
+    ours and it has to be done in screen coordinates.
+    """
+    getter = getattr(event, "globalPosition", None)
+    if getter is not None:
+        return getter().toPoint()
+    return event.globalPos()

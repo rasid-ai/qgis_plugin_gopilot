@@ -2,7 +2,7 @@
 import os
 import tempfile
 import requests
-from .config import API_BASE_URL, API_HOST, REQUEST_TIMEOUT, GOPILOT_LLM_BASE_URL
+from .config import API_BASE_URL, API_HOST, REQUEST_TIMEOUT, GOPILOT_LLM_BASE_URL, is_trusted_api_url
 from .gopilot_client import GoPilotClient
 from .logger import debug_print
 
@@ -188,6 +188,38 @@ class RasidClient:
         """Get user profile information."""
         response = self.session.get(
             self.base_url + "accounts/profile/",
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def get_gotokens(self):
+        """Get the GoToken wallet.
+
+        A SEPARATE call from :meth:`get_profile` on purpose: the balance is not
+        in the profile response. It used to be (the plugin read
+        ``profile["balance"]["amount"]`` and showed it as euros), but the
+        product moved to GoTokens and that field went away — leaving the plugin
+        reporting a confident "0" for everyone, because a missing key defaulted
+        to zero.
+
+        Returns the watcher's shape::
+
+            {
+              "wallet": {"balance": "2404153.0000",       # decimal AS A STRING
+                         "allowance_balance": "...",
+                         "topup_balance": "...",
+                         "monthly_allowance": "...",
+                         "is_overdrawn": false, ...} | null,
+              "can_send": true,
+              "rate_configured": true,
+            }
+
+        ``wallet`` is nullable — a user with no plan has no wallet at all,
+        which is NOT the same thing as a zero balance.
+        """
+        response = self.session.get(
+            self.base_url + "billing/gotokens/",
             timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
@@ -436,21 +468,22 @@ class RasidClient:
         if url.startswith("/"):
             url = API_HOST + url
 
-        # Check if this is an S3 URL or other external URL (not from our API)
-        # S3 URLs and external URLs should be downloaded without auth headers
-        is_external_url = (
-            url.startswith("https://s3.") or
-            url.startswith("https://") and ".s3." in url or
-            url.startswith("https://") and ".amazonaws.com" in url or
-            (url.startswith("https://") and not url.startswith(API_HOST + "/"))
-        )
-
-        if is_external_url:
-            # Use requests directly without authentication session
-            response = requests.get(url, timeout=60, stream=True)
-        else:
-            # Use authenticated session for API URLs
+        # Send the token to our own hosts, and to nobody else.
+        #
+        # This was a blocklist: "external" meant an S3-looking URL, or ANY
+        # https URL not starting with API_HOST — and GoPilot serves result
+        # files from `app.gopilot.earth`, so every download of a chat result
+        # went out unauthenticated and came back
+        # `401 Authentication credentials were not provided`.
+        #
+        # Inverted to an allowlist (config.is_trusted_api_url), which fixes
+        # that without the opposite failure: a presigned storage link in an
+        # answer is attacker-influenced, and it must not receive the user's
+        # credentials just because it does not look like S3.
+        if is_trusted_api_url(url):
             response = self.session.get(url, timeout=60, stream=True)
+        else:
+            response = requests.get(url, timeout=60, stream=True)
 
         response.raise_for_status()
 

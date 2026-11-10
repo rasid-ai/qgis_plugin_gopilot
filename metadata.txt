@@ -27,7 +27,7 @@ tags=AI, satellite, remote sensing, earth observation, cloud processing, machine
 
 homepage=https://github.com/rasid-ai/qgis_gopilot#readme
 category=Plugins
-icon=rasid_logo.svg
+icon=gopilot-mark.svg
 # experimental flag
 experimental=False
 

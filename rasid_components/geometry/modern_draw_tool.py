@@ -11,9 +11,11 @@ Features:
 - Modern glassmorphism styling
 """
 
-from qgis.PyQt.QtCore import pyqtSignal, Qt, QTimer, QRectF, QPointF
-from qgis.PyQt.QtGui import QColor, QPainter, QPen, QBrush, QFont, QCursor, QPixmap
-from qgis.PyQt.QtWidgets import QWidget, QHBoxLayout, QPushButton, QLabel, QVBoxLayout, QFrame
+from qgis.PyQt.QtCore import pyqtSignal, QTimer
+from qgis.PyQt.QtGui import QColor, QPainter, QPen, QBrush, QCursor, QPixmap
+from qgis.PyQt.QtWidgets import (
+    QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
+)
 from qgis.core import (
     QgsWkbTypes, QgsPointXY, QgsProject,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
@@ -24,11 +26,25 @@ from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
 from ..compat import (
     Qt_LeftButton, Qt_RightButton,
     Qt_Tool, Qt_FramelessWindowHint, Qt_WindowStaysOnTopHint,
-    Qt_WA_TranslucentBackground, QFrame_HLine, Qt_SolidLine,
     Qt_transparent, QPainter_Antialiasing,
+    Qt_WA_TranslucentBackground, Qt_SolidLine,
     Qt_Key_Escape, Qt_Key_Backspace, Qt_Key_Delete, Qt_Key_Return, Qt_Key_Enter,
 )
-from .. import theme_utils
+from .. import design, icons
+from ..widgets import (
+    Divider, danger_button, primary_button, secondary_button,
+)
+
+
+def _with_alpha(hex_colour, alpha):
+    """A token colour at a given 0-255 alpha, for Qt's canvas APIs.
+
+    ``design.alpha`` returns a CSS string for stylesheets; QgsRubberBand wants
+    a real QColor, so the conversion happens here rather than at each call.
+    """
+    colour = QColor(hex_colour)
+    colour.setAlpha(alpha)
+    return colour
 
 
 class DrawingToolbar(QWidget):
@@ -41,165 +57,101 @@ class DrawingToolbar(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt_Tool | Qt_FramelessWindowHint | Qt_WindowStaysOnTopHint)
+        self.setWindowFlags(Qt_Tool | Qt_FramelessWindowHint
+                            | Qt_WindowStaysOnTopHint)
         self.setAttribute(Qt_WA_TranslucentBackground)
 
-        # Main layout
+        t = design.tokens()
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Container frame with glassmorphism effect
+        # A SOLID card, not a glass panel.
+        #
+        # This was `rgba(30, 41, 59, 0.85)` — slate-900 at 85%, a colour from
+        # no palette the plugin uses, with white-translucent buttons on it. It
+        # is now the same surface, border and radius as every other card in
+        # the product.
+        #
+        # Solid rather than translucent on purpose: the toolbar floats over
+        # whatever imagery the user is tracing, and a translucent panel takes
+        # its legibility from the map underneath — which can be anything from
+        # snow to open water.
         self.frame = QFrame()
-        self.frame.setStyleSheet(f"""
-            QFrame {{
-                background: rgba(30, 41, 59, 0.85);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 12px;
-                padding: 12px;
-            }}
-        """)
+        self.frame.setObjectName("drawToolbar")
+        self.frame.setStyleSheet(
+            f"QFrame#drawToolbar {{ background:{t.surface}; "
+            f"border:1px solid {t.border}; "
+            f"border-radius:{design.RADIUS_LG}px; }}"
+        )
         frame_layout = QVBoxLayout(self.frame)
-        frame_layout.setContentsMargins(12, 12, 12, 12)
-        frame_layout.setSpacing(8)
+        frame_layout.setContentsMargins(design.SPACE_3, design.SPACE_3,
+                                        design.SPACE_3, design.SPACE_3)
+        frame_layout.setSpacing(design.SPACE_2)
 
-        # Title
-        title = QLabel("✏️ Drawing Mode")
-        title.setStyleSheet("""
-            QLabel {
-                color: white;
-                font-size: 14px;
-                font-weight: bold;
-                background: transparent;
-                border: none;
-            }
-        """)
-        frame_layout.addWidget(title)
+        # ── title ──────────────────────────────────────────────────────────
+        title_row = QHBoxLayout()
+        title_row.setSpacing(design.SPACE_2)
+        glyph = QLabel()
+        glyph.setPixmap(icons.pixmap("draw", design.ICON_SM, t.accent,
+                                     dpr=2.0))
+        glyph.setStyleSheet("background:transparent; border:none;")
+        title_row.addWidget(glyph)
+        title = QLabel("Draw an area")
+        title.setStyleSheet(design.heading_qss(design.TEXT_MD))
+        title_row.addWidget(title)
+        title_row.addStretch()
+        frame_layout.addLayout(title_row)
 
-        # Info label (points, area, etc.)
-        self.info_label = QLabel("0 points")
-        self.info_label.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.7);
-                font-size: 11px;
-                background: transparent;
-                border: none;
-                padding: 4px 0;
-            }
-        """)
+        # ── live measurements ─────────────────────────────────────────────
+        self.info_label = QLabel("Click the map to add points")
         self.info_label.setWordWrap(True)
+        self.info_label.setStyleSheet(
+            design.body_qss(design.TEXT_BASE, secondary=True))
         frame_layout.addWidget(self.info_label)
 
-        # Separator
-        separator = QFrame()
-        separator.setFrameShape(QFrame_HLine)
-        separator.setStyleSheet("background: rgba(255, 255, 255, 0.1); max-height: 1px;")
-        frame_layout.addWidget(separator)
+        frame_layout.addWidget(Divider())
 
-        # Buttons
-        button_style = """
-            QPushButton {
-                background: rgba(255, 255, 255, 0.1);
-                color: white;
-                border: 1px solid rgba(255, 255, 255, 0.2);
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-size: 12px;
-                text-align: left;
-            }
-            QPushButton:hover {
-                background: rgba(255, 255, 255, 0.2);
-                border-color: rgba(255, 255, 255, 0.3);
-            }
-            QPushButton:pressed {
-                background: rgba(255, 255, 255, 0.15);
-            }
-            QPushButton:disabled {
-                background: rgba(255, 255, 255, 0.05);
-                color: rgba(255, 255, 255, 0.3);
-            }
-        """
-
-        # Undo button
-        self.undo_btn = QPushButton("⎌ Undo Last Point")
-        self.undo_btn.setStyleSheet(button_style)
-        self.undo_btn.clicked.connect(self.undo_clicked.emit)
-        self.undo_btn.setEnabled(False)
-        self.undo_btn.setToolTip("Remove last point (Backspace)")
-        frame_layout.addWidget(self.undo_btn)
-
-        # Clear button
-        self.clear_btn = QPushButton("🗑️ Clear All")
-        self.clear_btn.setStyleSheet(button_style)
-        self.clear_btn.clicked.connect(self.clear_clicked.emit)
-        self.clear_btn.setEnabled(False)
-        self.clear_btn.setToolTip("Remove all points and start over")
-        frame_layout.addWidget(self.clear_btn)
-
-        # Finish button
-        self.finish_btn = QPushButton("✓ Finish Polygon")
-        self.finish_btn.setStyleSheet("""
-            QPushButton {
-                background: rgba(34, 197, 94, 0.8);
-                color: white;
-                border: 1px solid rgba(34, 197, 94, 0.4);
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-size: 12px;
-                font-weight: bold;
-                text-align: left;
-            }
-            QPushButton:hover {
-                background: rgba(34, 197, 94, 1);
-            }
-            QPushButton:pressed {
-                background: rgba(34, 197, 94, 0.7);
-            }
-            QPushButton:disabled {
-                background: rgba(34, 197, 94, 0.3);
-                color: rgba(255, 255, 255, 0.5);
-            }
-        """)
-        self.finish_btn.clicked.connect(self.finish_clicked.emit)
+        # ── actions ───────────────────────────────────────────────────────
+        # The product's own buttons, and the icon registry instead of emoji.
+        # The old labels were "⎌ Undo Last Point", "🗑️ Clear All", "✓ Finish
+        # Polygon", "✕ Cancel" — four emoji that Windows draws as full-colour
+        # glyphs at whatever size the host font picks.
+        self.finish_btn = primary_button("Finish area", icon_name="check")
         self.finish_btn.setEnabled(False)
-        self.finish_btn.setToolTip("Complete polygon (Right-click or Enter)")
+        self.finish_btn.setToolTip("Complete the area (Enter or right-click)")
+        self.finish_btn.clicked.connect(self.finish_clicked.emit)
         frame_layout.addWidget(self.finish_btn)
 
-        # Cancel button
-        cancel_btn = QPushButton("✕ Cancel")
-        cancel_btn.setStyleSheet("""
-            QPushButton {
-                background: rgba(239, 68, 68, 0.6);
-                color: white;
-                border: 1px solid rgba(239, 68, 68, 0.3);
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-size: 12px;
-                text-align: left;
-            }
-            QPushButton:hover {
-                background: rgba(239, 68, 68, 0.8);
-            }
-            QPushButton:pressed {
-                background: rgba(239, 68, 68, 0.5);
-            }
-        """)
-        cancel_btn.clicked.connect(self.cancel_clicked.emit)
-        cancel_btn.setToolTip("Cancel drawing (ESC)")
-        frame_layout.addWidget(cancel_btn)
+        self.undo_btn = secondary_button("Undo last point",
+                                         icon_name="undo")
+        self.undo_btn.setEnabled(False)
+        self.undo_btn.setToolTip("Remove the last point (Backspace)")
+        self.undo_btn.clicked.connect(self.undo_clicked.emit)
+        frame_layout.addWidget(self.undo_btn)
 
-        # Shortcuts hint
-        hint = QLabel("💡 Shortcuts: Backspace (undo) • Enter (finish) • ESC (cancel)")
-        hint.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.5);
-                font-size: 10px;
-                background: transparent;
-                border: none;
-                padding: 4px 0 0 0;
-            }
-        """)
+        self.clear_btn = secondary_button("Clear points", icon_name="refresh")
+        self.clear_btn.setEnabled(False)
+        self.clear_btn.setToolTip("Remove every point and start again")
+        self.clear_btn.clicked.connect(self.clear_clicked.emit)
+        frame_layout.addWidget(self.clear_btn)
+
+        # Cancel is the only destructive one here: finishing keeps the area,
+        # clearing keeps the tool, cancelling throws the work away.
+        self.cancel_btn = danger_button("Cancel", icon_name="close")
+        self.cancel_btn.setToolTip("Discard this area (Esc)")
+        self.cancel_btn.clicked.connect(self.cancel_clicked.emit)
+        frame_layout.addWidget(self.cancel_btn)
+
+        frame_layout.addWidget(Divider())
+
+        hint = QLabel("Backspace undo \u00b7 Enter finish \u00b7 Esc cancel")
         hint.setWordWrap(True)
+        hint.setStyleSheet(
+            f"background:transparent; border:none; color:{t.text_muted}; "
+            f"font-family:{design.FONT_STACK}; "
+            f"font-size:{design.TEXT_XS}px;")
         frame_layout.addWidget(hint)
 
         layout.addWidget(self.frame)
@@ -207,11 +159,11 @@ class DrawingToolbar(QWidget):
     def update_info(self, point_count, area_text="", perimeter_text=""):
         """Update the info label with current stats"""
         if point_count == 0:
-            text = "Click to add points"
+            text = "Click the map to add points"
         elif point_count == 1:
-            text = "1 point\nClick to add more"
+            text = "1 point \u00b7 add at least two more"
         elif point_count == 2:
-            text = f"2 points\n{perimeter_text}\nNeed 1 more for polygon"
+            text = f"2 points \u00b7 one more to close the area\n{perimeter_text}"
         else:
             text = f"{point_count} points\n{area_text}\n{perimeter_text}"
 
@@ -241,10 +193,18 @@ class ModernDrawTool(QgsMapTool):
         self.canvas = canvas
         self._points = []
 
-        # Rubber band for the polygon
+        # Rubber band for the polygon, in the brand accent.
+        #
+        # This was #3B82F6 — a blue that appears nowhere else in the product.
+        # The area being drawn is the most prominent thing on screen while the
+        # tool is live, and it was the one piece of GoPilot's UI that did not
+        # look like GoPilot.
+        t = design.tokens()
         self._rb = QgsRubberBand(canvas, QgsWkbTypes.GeometryType.PolygonGeometry)
-        self._rb.setColor(QColor(59, 130, 246, 60))  # Blue with transparency
-        self._rb.setStrokeColor(QColor(59, 130, 246))
+        # The fill is deliberately weak: it sits over imagery the user is
+        # tracing, and anything heavier hides the feature they are outlining.
+        self._rb.setColor(_with_alpha(t.accent, 55))
+        self._rb.setStrokeColor(QColor(t.accent))
         self._rb.setWidth(3)
         self._rb.setLineStyle(Qt_SolidLine)
 
@@ -288,8 +248,17 @@ class ModernDrawTool(QgsMapTool):
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter_Antialiasing)
 
-        # Draw crosshair
-        pen = QPen(QColor(59, 130, 246))
+        # Draw crosshair, in the accent. A white outline goes under it first
+        # so the cursor stays visible over dark imagery as well as light —
+        # the single-colour version disappeared over water and shadow.
+        accent = QColor(design.tokens().accent)
+        halo = QPen(QColor("#FFFFFF"))
+        halo.setWidth(4)
+        painter.setPen(halo)
+        painter.drawLine(16 - 8, 16, 16 + 8, 16)
+        painter.drawLine(16, 16 - 8, 16, 16 + 8)
+
+        pen = QPen(accent)
         pen.setWidth(2)
         painter.setPen(pen)
 
@@ -302,7 +271,7 @@ class ModernDrawTool(QgsMapTool):
         painter.drawLine(center, center - size, center, center + size)
 
         # Center dot
-        painter.setBrush(QBrush(QColor(59, 130, 246)))
+        painter.setBrush(QBrush(accent))
         painter.drawEllipse(center - 2, center - 2, 4, 4)
 
         painter.end()
@@ -327,8 +296,10 @@ class ModernDrawTool(QgsMapTool):
         """Add an enhanced vertex marker at the given point"""
         marker = QgsVertexMarker(self.canvas)
         marker.setCenter(point)
-        marker.setColor(QColor(59, 130, 246))
-        marker.setFillColor(QColor(255, 255, 255))
+        # Accent ring, white centre: the white is what keeps a vertex
+        # findable over dark imagery, the ring is what makes it ours.
+        marker.setColor(QColor(design.tokens().accent))
+        marker.setFillColor(QColor("#FFFFFF"))
         marker.setIconSize(12)
         marker.setIconType(QgsVertexMarker.IconType.ICON_CIRCLE)
         marker.setPenWidth(3)

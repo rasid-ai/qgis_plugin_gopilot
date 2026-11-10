@@ -1,170 +1,140 @@
+"""Theme-aware colour utilities — compatibility facade over :mod:`design`.
+
+WHAT THIS IS NOW
+================
+This module used to own the plugin's colours as a short list of hardcoded
+greys (``#2c3e50``, ``#f7f8fa``, ``#333333``, …). Those greys were COOL, while
+the RASID brand neutral is a warm taupe (``#5F575A``), so every panel read
+slightly blue next to the SaaS. The palette now lives in :mod:`design`, ported
+directly from the SaaS ``tailwind.config.js``.
+
+Rather than rewrite nine pages at once, every function below is kept with its
+original name and signature and simply forwards to the matching semantic token.
+So the existing pages (processes, projects, solutions, wizard, login, feedback,
+drawing help) re-tone to the brand palette without being touched, and new code
+can use the richer token set in :mod:`design` directly.
+
+WHICH ONE SHOULD I USE?
+-----------------------
+* **New widgets** — use :mod:`design`. It has surfaces, borders, chat, state
+  and scrollbar tokens plus the component stylesheet recipes, and it is the
+  file that stays in sync with the SaaS.
+* **Existing widgets** — these helpers are fine. They are a stable facade, not
+  deprecated-and-rotting, but they only expose a fraction of the tokens.
+
+Mapping, for reference when porting a page over:
+
+====================================  =====================
+``theme_utils``                       ``design.tokens()``
+====================================  =====================
+``get_text_color()``                  ``.text``
+``get_secondary_text_color()``        ``.text_secondary``
+``get_card_bg()``                     ``.surface``
+``get_card_border()``                 ``.border``
+``get_sidebar_bg()``                  ``.surface_alt``
+``get_sidebar_border()``              ``.border``
+``get_hover_bg()``                    ``.hover``
+``get_separator_color()``             ``.divider``
+``BRAND_PRIMARY``                     ``.accent``
+``BRAND_HOVER``                       ``.accent_hover``
+``BRAND_DANGER``                      ``.error``
+====================================  =====================
+
+THE BRAND CONSTANTS ARE DYNAMIC
+===============================
+``BRAND_PRIMARY``, ``BRAND_HOVER`` and friends look like module constants but
+are resolved per-theme through :pep:`562` module ``__getattr__``. They have to
+be: ``#008B6A`` on a dark QGIS surface is a 3.0:1 contrast ratio, which fails
+WCAG AA for the small text and icons the plugin paints on it, so dark mode uses
+the brighter end of the same brand ramp.
+
+This only works through ATTRIBUTE access::
+
+    from . import theme_utils          # correct — resolves per call
+    theme_utils.BRAND_PRIMARY
+
+    from .theme_utils import BRAND_PRIMARY   # WRONG — freezes one theme's value
+
+Every caller in the plugin uses the first form; keep it that way.
 """
-Theme-aware color utilities
 
-PROBLEM
-=======
-If a user uses dark theme option in QGIS -> since the plugin was using hardcoded colors 
-(white backgrounds, dark text) became invisible in dark mode. 
+from . import design
 
-SOLUTION
-========
-This module detects the active QGIS theme at runtime and provides theme-aware colors:
-- Automatically adapts text colors: light text for dark themes, dark text for light themes
-- Adjusts backgrounds: dark backgrounds for dark themes, light backgrounds for light themes
-- Maintains brand colors (green, red) consistently across themes
-- Ensures proper contrast ratios for readability
+# Names that resolve through __getattr__ below instead of being bound here.
+_DYNAMIC = {
+    "BRAND_PRIMARY":     lambda t: t.accent,
+    "BRAND_HOVER":       lambda t: t.accent_hover,
+    "BRAND_PRESSED":     lambda t: t.accent_pressed,
+    "BRAND_LIGHT":       lambda t: t.accent_soft,
+    "BRAND_DANGER":      lambda t: t.error,
+    "BRAND_DANGER_HOVER":      lambda t: t.error_soft,
+    "BRAND_DANGER_HOVER_DARK": lambda t: t.error_soft,
+    "BRAND_SUCCESS":     lambda t: t.success,
+    "BRAND_WARNING":     lambda t: t.warning,
+}
 
-HOW IT WORKS
-============
-1. is_dark_theme() checks the palette background luminance (< 128 = dark)
-2. get_*_color() functions return appropriate colors based on current theme
-3. All UI components import from this module instead of hardcoding colors
-4. Colors automatically update if user switches themes (requires plugin restart)
 
-USAGE
-=====
-In your UI code:
-    from . import theme_utils
+def __getattr__(name):
+    """Resolve the brand constants against the live theme (see module docs)."""
+    resolver = _DYNAMIC.get(name)
+    if resolver is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return resolver(design.tokens())
 
-    text_color = theme_utils.get_text_color()
-    label.setStyleSheet(f"color: {text_color};")
 
-    card_bg = theme_utils.get_card_bg()
-    frame.setStyleSheet(f"background: {card_bg};")
-
-PyQt5/PyQt6 COMPATIBILITY
-=========================
-The color detection uses QPalette.ColorRole which differs between PyQt5 and PyQt6.
-We try PyQt6 style first (ColorRole.Window), with fallback to PyQt5 (Window).
-"""
-
-from qgis.PyQt.QtWidgets import QApplication
-from qgis.PyQt.QtGui import QPalette
+def __dir__():
+    return sorted(list(globals()) + list(_DYNAMIC))
 
 
 def is_dark_theme():
-    """
-    Detect if QGIS is using a dark theme.
+    """True when QGIS is running a dark theme.
 
-    Checks the background color's luminance. If luminance < 128 (on 0-255 scale),
-    the theme is considered dark. This threshold provides reliable detection
-    across different dark theme implementations.
-
-    Returns:
-        bool: True if dark theme is active, False otherwise
+    Decided from the luminance of the palette's Window colour, not the theme
+    name — users rename and ship their own themes.
     """
-    palette = QApplication.palette()
-    # Scoped enum (QPalette.ColorRole.Window) works on both PyQt5 5.15+ and PyQt6.
-    bg_color = palette.color(QPalette.ColorRole.Window)
-    # Check if background is dark (luminance < 128)
-    luminance = (0.299 * bg_color.red() + 0.587 * bg_color.green() + 0.114 * bg_color.blue())
-    return luminance < 128
+    return design.is_dark()
 
 
 def get_text_color():
-    """
-    Get appropriate primary text color based on theme.
-
-    Returns:
-        str: Light gray (#e0e0e0) for dark theme, dark gray (#2c3e50) for light theme
-    """
-    return "#e0e0e0" if is_dark_theme() else "#2c3e50"
+    """Primary text colour."""
+    return design.tokens().text
 
 
 def get_secondary_text_color():
-    """
-    Get secondary/muted text color based on theme.
-    Used for labels, descriptions, and less important text.
-
-    Returns:
-        str: Medium gray (#b0b0b0) for dark theme, darker gray (#666666) for light theme
-    """
-    return "#b0b0b0" if is_dark_theme() else "#666666"
+    """Muted text — labels, descriptions, helper copy."""
+    return design.tokens().text_secondary
 
 
 def get_sidebar_bg():
-    """
-    Get sidebar and header background color based on theme.
-    Used for navigation panels and section headers.
-
-    Returns:
-        str: Dark gray (#2b2b2b) for dark theme, light gray (#f7f8fa) for light theme
-    """
-    return "#2b2b2b" if is_dark_theme() else "#f7f8fa"
+    """Background for sidebars, headers and other recessed surfaces."""
+    return design.tokens().surface_alt
 
 
 def get_sidebar_border():
-    """
-    Get sidebar border color based on theme.
-
-    Returns:
-        str: Medium dark gray (#444444) for dark theme, light gray (#ddd) for light theme
-    """
-    return "#444444" if is_dark_theme() else "#ddd"
+    """Border between a sidebar and the content beside it."""
+    return design.tokens().border
 
 
 def get_hover_bg():
-    """
-    Get button/item hover background color based on theme.
-    Used for interactive elements on hover state.
-
-    Returns:
-        str: Slightly lighter dark (#3a3a3a) for dark theme, light green (#e8f5f3) for light theme
-    """
-    return "#3a3a3a" if is_dark_theme() else "#e8f5f3"
+    """Hover wash for interactive rows and icon buttons."""
+    return design.tokens().hover
 
 
 def get_separator_color():
-    """
-    Get separator/divider line color based on theme.
-    Used for horizontal rules and borders between sections.
-
-    Returns:
-        str: Medium dark gray (#444444) for dark theme, light gray (#ddd) for light theme
-    """
-    return "#444444" if is_dark_theme() else "#ddd"
+    """Divider / horizontal-rule colour."""
+    return design.tokens().divider
 
 
 def get_card_bg():
-    """
-    Get card/panel background color based on theme.
-    Used for content cards, dialogs, and main content areas.
-
-    Returns:
-        str: Dark gray (#333333) for dark theme, white (#ffffff) for light theme
-    """
-    return "#333333" if is_dark_theme() else "#ffffff"
+    """Card, dialog and input background."""
+    return design.tokens().surface
 
 
 def get_card_border():
-    """
-    Get card/input border color based on theme.
-    Used for outlining cards, input fields, and containers.
-
-    Returns:
-        str: Medium gray (#444444) for dark theme, light gray (#e0e0e0) for light theme
-    """
-    return "#444444" if is_dark_theme() else "#e0e0e0"
-
-
-# Brand colors (remain constant across themes for consistency)
-# These colors are part of the Rasid brand identity and should not change
-BRAND_PRIMARY = "#00856F"  # Rasid teal/green - primary action color
-BRAND_HOVER = "#009980"    # Lighter teal - hover state for primary buttons
-BRAND_DANGER = "#e74c3c"   # Red - destructive actions (delete, cancel)
-
-
-# Theme-aware brand color variations
-BRAND_DANGER_HOVER = "#fdeaea"  # Light red tint - for light theme hover
-BRAND_DANGER_HOVER_DARK = "#3d1f1f"  # Dark red tint - for dark theme hover
+    """Card and input border."""
+    return design.tokens().border
 
 
 def get_danger_hover_bg():
-    """
-    Get danger button hover background color based on theme.
-    Used for delete/cancel button hover states.
-
-    Returns:
-        str: Dark red (#3d1f1f) for dark theme, light red (#fdeaea) for light theme
-    """
-    return BRAND_DANGER_HOVER_DARK if is_dark_theme() else BRAND_DANGER_HOVER
+    """Hover wash behind a destructive action."""
+    return design.tokens().error_soft

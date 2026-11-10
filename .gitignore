@@ -4,3 +4,5 @@ __pycache__/
 *.zip
 libs/
 qgis_gopilot_venv/
+# Written by QGIS into the plugin directory at runtime, not ours to ship.
+symbology-style.db
