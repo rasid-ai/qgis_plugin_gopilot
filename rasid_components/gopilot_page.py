@@ -1,846 +1,302 @@
-# -*- coding: utf-8 -*-
-"""
-GoPilot AI Chat Page
+"""The GoPilot chat view: transcript, status strip and composer.
 
-Architecture
-------------
-Widget-per-message (like the QScrollArea version), but each message body is a
-word-wrapped QLabel instead of a QTextBrowser.
+WHAT CHANGED FROM THE WINDOWED VERSION
+======================================
+This used to be a ``QSplitter`` with a permanent 200px history pane on the left
+and the conversation on the right, inside a 1087px modal dialog. Docked to the
+side of the QGIS window there is no room for that, and no need: history moved
+to its own view behind the rail (:mod:`history_panel`), the composer moved to
+:mod:`composer`, and the bubble moved to :mod:`message_bubble`. What is left
+here is the transcript and the turn-taking logic.
 
-Why this is the right call for a distributable QGIS plugin:
+BUBBLE WIDTH IS COMPUTED, NOT CONSTANT
+======================================
+Bubbles used to be capped at a hardcoded 560px — wider than the entire dock, so
+every one of them was clipped at the panel edge. :meth:`_apply_bubble_widths`
+re-caps every bubble from the viewport width on each resize. Assistant messages
+get nearly the full width (they carry tables and code); the user's own get 86%,
+so the conversation still reads as two columns rather than one wall.
 
-  * QLabel is *built* to size-to-content. Give it a max width and word wrap,
-    and it computes its own height via heightForWidth(). That deletes the
-    entire `_MessageBody` height-chasing apparatus from the QTextBrowser
-    version (documentSizeChanged, DOC_MARGIN, SLACK, scrollbar suppression,
-    wheelEvent overrides) — none of it is needed here.
-
-  * Because each bubble reports an honest sizeHint, the layout settles on its
-    own. So the takeWidget()/setWidget() + processEvents() "refresh hack" is
-    gone too. Scrolling to bottom is a single deferred call.
-
-  * It does NOT depend on QWebEngineView. That widget would give nicer CSS
-    (true rounded corners, max-width), but it is frequently absent from QGIS
-    installs (notably Windows OSGeo4W), so importing it crashes those users.
-    QLabel rich text renders everywhere QGIS runs.
-
-  * All messages are rendered as Markdown using the markdown library, which is
-    required and bundled with the plugin.
-
-Streaming is fully wired: begin_ai_stream() -> update_ai_stream(full_text) ->
-finish_ai_stream(). The current SendMessageThread uses the simple
-"replace the thinking bubble" path; the streaming hooks are ready if/when your
-transport can emit partial chunks.
+MODALITY
+========
+Nothing here is modal. The old dialog ran under ``exec()``, which blocked the
+whole QGIS main window — so you could not pan the map to look at what you were
+asking about. Docked and non-modal, drawing an area no longer needs the panel to
+minimise itself first.
 """
 
 import os
-import re
-import tempfile
+
+from qgis.PyQt.QtCore import QDateTime, QTimer, pyqtSignal
 from qgis.PyQt.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton, QScrollArea,
-    QLabel, QFrame, QListWidget, QSplitter, QListWidgetItem, QMessageBox,
-    QSizePolicy,
+    QMessageBox,
+    QFrame, QGridLayout, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
 )
-from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal, QDateTime, QTimer, QUrl
-from qgis.PyQt.QtGui import QIcon, QPixmap, QPainter, QColor, QPen
-from qgis.PyQt.QtNetwork import QNetworkAccessManager, QNetworkRequest
 
+from . import branding, design, icons
+from .chat_threads import (
+    FetchUploadLimitsThread,
+    HideMessageThread,
+    FetchMessagesThread, FetchPromptSuggestionsThread,
+    SendMessageThread, stop_threads, thinking_text,
+)
 from .compat import (
-    Qt_AlignTop, Qt_AlignRight, Qt_AlignLeft, Qt_AlignCenter, Qt_UserRole,
-    Qt_PointingHandCursor, Qt_Horizontal, QFrame_NoFrame, QFrame_StyledPanel,
-    Qt_transparent, QPainter_Antialiasing, Qt_SmoothTransformation,
-    QMessageBox_Question, QMessageBox_Warning, QMessageBox_Yes,
-    QMessageBox_No, QMessageBox_Ok, exec_dialog,
-    QSizePolicy_Expanding,
+    QMessageBox_No,
+    QMessageBox_Yes,
+    Qt_AlignCenter, Qt_AlignVCenter, Qt_LeftButton, Qt_PointingHandCursor,
 )
-from . import theme_utils
+from .composer import Composer
 from .geometry import GeometryInputManager
-import markdown
-import json
 from .logger import debug_print
-
-# ── Layer download and loading helpers ────────────────────────────────────────
-
-
-class DownloadLayerThread(QThread):
-    """Thread for downloading layer files from URLs"""
-    finished = pyqtSignal(str)  # file path
-    error = pyqtSignal(str)
-
-    def __init__(self, client, url, filename=None):
-        super().__init__()
-        self.client = client
-        self.url = url
-        self.filename = filename
-
-    def run(self):
-        try:
-            path = self.client.download_file(
-                self.url, tempfile.mkdtemp(prefix="rasid_download_"))
-            if self.filename:
-                extension = os.path.splitext(self.filename)[1]
-                if extension and not path.lower().endswith(extension.lower()):
-                    os.replace(path, path + extension)
-                    path += extension
-            self.finished.emit(path)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-def _add_layer_to_qgis(filepath, layer_name):
-    """Add a downloaded layer to the top-level GoPilot group."""
-    from qgis.core import QgsProject, QgsVectorLayer, QgsRasterLayer
-
-    root = QgsProject.instance().layerTreeRoot()
-    target_group = root.findGroup("GoPilot")
-    if target_group is None:
-        target_group = root.insertGroup(0, "GoPilot")
-
-    ext = filepath.rsplit(".", 1)[-1].lower()
-    if ext in ("tif", "tiff", "png", "jpg", "jpeg"):
-        layer = QgsRasterLayer(filepath, layer_name)
-    else:
-        layer = QgsVectorLayer(filepath, layer_name, "ogr")
-
-    if not layer.isValid():
-        raise Exception(f"Could not load layer from {filepath}")
-
-    QgsProject.instance().addMapLayer(layer, False)
-    target_group.addLayer(layer)
-
-
-def _extract_file_urls(text):
-    """Extract downloadable file URLs from text (including markdown links).
-
-    Returns list of tuples: (url, filename, extension, is_image)
-    """
-    # Match file links even when the download URL itself has no extension.
-    markdown_pattern = r'\[([^\]]+)\]\(<?((?:https?://|/)[^\s\)>]+)>?\)'
-    markdown_matches = re.findall(markdown_pattern, text, re.IGNORECASE)
-
-    result = []
-    for label, url in markdown_matches:
-        url_filename = url.split('/')[-1].split('?')[0]
-        label_match = re.search(
-            r'([^/\\]+\.(?:tif|tiff|png|jpg|jpeg|shp|geojson|gpkg|zip))$',
-            label.strip(), re.IGNORECASE)
-        filename = url_filename if re.search(
-            r'\.(?:tif|tiff|png|jpg|jpeg|shp|geojson|gpkg|zip)$',
-            url_filename, re.IGNORECASE) else (
-                label_match.group(1) if label_match else None)
-        if not filename:
-            continue
-        ext = filename.rsplit('.', 1)[-1].lower()
-        is_image = ext in ('png', 'jpg', 'jpeg')
-        result.append((url, filename, ext, is_image))
-
-    # Also match plain URLs (not in markdown) for backward compatibility
-    plain_pattern = r'(?<!\]\()https?://[^\s<>"]+\.(?:tif|tiff|png|jpg|jpeg|shp|geojson|gpkg|zip)(?:\?[^\s<>"]*)?'
-    plain_matches = re.findall(plain_pattern, text, re.IGNORECASE)
-
-    for url in plain_matches:
-        filename = url.split('/')[-1].split('?')[0]
-        ext = filename.rsplit('.', 1)[-1].lower()
-        is_image = ext in ('png', 'jpg', 'jpeg')
-        # Avoid duplicates from markdown matches
-        if not any(existing_url == url for existing_url, _, _, _ in result):
-            result.append((url, filename, ext, is_image))
-
-    return result
-
-
-# ── Qt enum resolution that works on both PyQt5 and PyQt6 ─────────────────────
-def _flag(*candidates):
-    """Return the first Qt flag/enum that resolves, across PyQt5/PyQt6."""
-    for path in candidates:
-        obj = Qt
-        ok = True
-        for part in path.split("."):
-            obj = getattr(obj, part, None)
-            if obj is None:
-                ok = False
-                break
-        if ok:
-            return obj
-    return None
-
-
-_RICH_TEXT = _flag("TextFormat.RichText", "RichText") or 1
-_SELECTABLE = _flag(
-    "TextInteractionFlag.TextSelectableByMouse", "TextSelectableByMouse"
-)
-_LINKS = _flag(
-    "TextInteractionFlag.LinksAccessibleByMouse", "LinksAccessibleByMouse"
+from .message_bubble import MessageBubble
+from .widgets import (
+    paint_transparent,
+    paint_background,
+    WrappedLabel, body_label, enable_height_for_width, heading,
+    styled_scroll_area,
 )
 
-# HttpStatusCodeAttribute, resolved across PyQt5 (enum on the class) and
-# PyQt6 (nested under QNetworkRequest.Attribute).
-_HTTP_STATUS_ATTR = getattr(
-    QNetworkRequest, "HttpStatusCodeAttribute",
-    getattr(getattr(QNetworkRequest, "Attribute", None),
-            "HttpStatusCodeAttribute", None),
+# Shown on an empty chat. Static rather than server-driven (the SaaS fetches
+# these): the plugin's useful openers are about the user's OWN loaded layers,
+# which only the plugin knows about.
+# (icon, title, description). The title is what gets typed into the composer;
+# the description says what will happen, so the card is a promise rather than
+# just a phrase. Concrete, named places on purpose — "Analyse a layer" taught
+# nobody what GoPilot can actually do, while "Count the trees in Kensington
+# Gardens" does.
+#
+# Static rather than server-driven (the SaaS fetches its own set): the plugin's
+# useful openers are the ones that touch the user's QGIS project, which only
+# the plugin knows about. The last two are exactly those.
+SUGGESTIONS = (
+    ("map-pin", "Find the Three Gorges Dam",
+     "Locate it and frame the map there"),
+    ("layers", "Map buildings within 2 km of the Eiffel Tower",
+     "Building footprints inside a 2 km radius"),
+    ("sparkle", "How severely did the 2023 Maui fires burn?",
+     "Burn severity across the wildfire zone"),
+    ("search", "Count the trees in Kensington Gardens",
+     "Detection and a total, London"),
+    ("alert", "Flood risk layers for the Nile Delta",
+     "Find the exposure layers, then add them to my project"),
+    ("draw", "Classify land cover for an area I draw",
+     "Draw an AOI and get a classified raster back"),
 )
 
 
-# ── Markdown -> HTML ──────────────────────────────────────────────────────────
+class _SuggestionCard(QFrame):
+    """One opener: an icon badge, a title, and what it will do.
 
-
-def _style_code_blocks(html_text, dark_text=True):
-    """Inline-style <pre>/<code> so QLabel rich text renders them nicely.
-
-    QLabel doesn't apply an external stylesheet to inner HTML tags, so the
-    only reliable way to style code is inline attributes on the generated HTML.
-    """
-    pre_bg = "rgba(0,0,0,0.06)" if dark_text else "rgba(255,255,255,0.18)"
-    pre = (f'<pre style="background:{pre_bg}; padding:8px 10px; '
-           f'border-radius:6px; font-family:Menlo,Consolas,monospace; '
-           f'font-size:12px; white-space:pre-wrap;">')
-    code = ('<code style="font-family:Menlo,Consolas,monospace; '
-            'font-size:12px;">')
-    return html_text.replace("<pre>", pre).replace("<code>", code)
-
-
-def _style_tables(html_text):
-    """Inline-style tables with theme-aware colors so they read in both modes.
-
-    QLabel rich text does not apply an external stylesheet to inner HTML, and it
-    honors ``background-color`` (not the ``background`` shorthand) on cells — so
-    colors must be set inline, per cell. Previously these were hardcoded to dark
-    text on a light background, which made table text unreadable in dark mode
-    (dark text on the dark bubble). Colors now come from theme_utils.
-    """
-    text_color = theme_utils.get_text_color()
-    border_color = theme_utils.get_card_border()
-    cell_bg = theme_utils.get_sidebar_bg()
-    header_bg = theme_utils.get_hover_bg()
-
-    # Style the table element
-    table = (f'<table style="border-collapse:collapse; width:100%; margin:10px 0; '
-             f'border:1px solid {border_color}; background-color:{cell_bg}; '
-             f'font-size:12px;">')
-
-    # Style table headers
-    th = (f'<th style="background-color:{header_bg}; color:{text_color}; '
-          f'font-weight:bold; text-align:left; padding:8px 10px; '
-          f'border:1px solid {border_color};">')
-
-    # Style table cells (set background-color per cell so they are never
-    # transparent over a dark bubble)
-    td = (f'<td style="background-color:{cell_bg}; color:{text_color}; '
-          f'padding:6px 10px; border:1px solid {border_color};">')
-
-    html_text = html_text.replace("<table>", table)
-    html_text = html_text.replace("<th>", th)
-    html_text = html_text.replace("<td>", td)
-
-    return html_text
-
-
-def _render_body_html(text, dark_text=True):
-    """Produce the HTML string a QLabel will display for a message body."""
-    text = str(text or "")
-    body = markdown.markdown(
-        text, extensions=["fenced_code", "tables", "nl2br"]
-    )
-    # Apply inline styles for code blocks and tables
-    body = _style_code_blocks(body, dark_text=dark_text)
-    body = _style_tables(body)
-    return body
-
-
-# ── Trash icon (unchanged) ────────────────────────────────────────────────────
-def create_trash_icon(size=24, color="#e74c3c"):
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt_transparent)
-    p = QPainter(pixmap)
-    p.setRenderHint(QPainter_Antialiasing)
-    pen = QPen(QColor(color))
-    pen.setWidth(2)
-    p.setPen(pen)
-    bt, bb = int(size * 0.35), int(size * 0.85)
-    bl, br = int(size * 0.25), int(size * 0.75)
-    p.drawRect(bl, bt, br - bl, bb - bt)
-    lid = int(size * 0.3)
-    p.drawLine(int(size * 0.2), lid, int(size * 0.8), lid)
-    hy = int(size * 0.2)
-    p.drawLine(int(size * 0.4), lid, int(size * 0.4), hy)
-    p.drawLine(int(size * 0.6), lid, int(size * 0.6), hy)
-    p.drawLine(int(size * 0.4), hy, int(size * 0.6), hy)
-    p.drawLine(int(size * 0.5), int(size * 0.45),
-               int(size * 0.5), int(size * 0.75))
-    p.end()
-    return QIcon(pixmap)
-
-
-# ══════════════════════════════ Threads (unchanged logic) ════════════════════
-class SendMessageThread(QThread):
-    finished = pyqtSignal(dict)
-    error = pyqtSignal(str)
-    progress = pyqtSignal(str)
-
-    def __init__(self, client, message, session_id=None, input_metadata=None, geojson_data=None):
-        super().__init__()
-        self.client = client
-        self.message = message
-        self.session_id = session_id
-        self.input_metadata = input_metadata
-        self.geojson_data = geojson_data
-
-    def run(self):
-        import time
-        try:
-            if not self.client.gopilot:
-                raise Exception(
-                    "GoPilot client not initialized. Check your API key.")
-            debug_print(
-                f"[GoPilot] Starting SendMessageThread with message: {self.message[:100]}...")
-
-            # If GeoJSON is attached, save it to a temporary file before either
-            # creating a session or sending to an existing one.
-            files_to_upload = None
-            if self.geojson_data:
-                import tempfile
-                import os
-
-                temp_dir = tempfile.gettempdir()
-                geojson_path = os.path.join(
-                    temp_dir, "attached_geometry.geojson")
-
-                with open(geojson_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.geojson_data, f, indent=2)
-
-                files_to_upload = [geojson_path]
-                debug_print(
-                    f"[GoPilot] Attaching GeoJSON file: {geojson_path}")
-
-            if not self.session_id:
-                self.progress.emit("Creating new chat session...")
-                result = self.client.gopilot.create_session(
-                    title="New Chat",
-                    content=self.message,
-                    input_metadata=self.input_metadata,
-                    files=files_to_upload,
-                )
-                debug_print(f"[GoPilot] Create-session response: {result}")
-                if not isinstance(result, dict):
-                    raise Exception(
-                        f"Invalid session response: {type(result)}")
-
-                # The create endpoint returns `session_id` and already queues
-                # the first message. Do not send that message a second time.
-                self.session_id = result.get("session_id") or result.get("id")
-                if not self.session_id:
-                    raise Exception(
-                        f"Create-session response has no session ID: {result}")
-                debug_print(f"[GoPilot] Session ID: {self.session_id}")
-            else:
-                self.progress.emit("Sending message to AI...")
-                debug_print(
-                    f"[GoPilot] Sending message to session {self.session_id}: "
-                    f"{self.message[:100]}...")
-                result = self.client.gopilot.send_message(
-                    session_id=self.session_id,
-                    content=self.message,
-                    input_metadata=self.input_metadata,
-                    files=files_to_upload
-                )
-                debug_print(f"[GoPilot] Send-message response: {result}")
-
-            if not isinstance(result, dict):
-                raise Exception(f"Unexpected response type: {type(result)}")
-
-            task_info = result.get("task", {})
-            task_id = task_info.get("task_id") if isinstance(
-                task_info, dict) else None
-            if not task_id:
-                raise Exception("No task_id in response")
-
-            message_content = None
-            self.progress.emit("AI is thinking...")
-            max_attempts, poll_interval = 60, 2
-
-            for attempt in range(max_attempts):
-                time.sleep(poll_interval)
-                try:
-                    status = self.client.gopilot.get_task_status(task_id)
-                    task_status = status.get("status", "unknown")
-                    pct = status.get("progress", 0)
-                    if pct > 0:
-                        self.progress.emit(f"AI is thinking... {pct}%")
-                    if task_status == "completed":
-                        llm = status.get("llm_message", {})
-                        if isinstance(llm, dict):
-                            message_content = llm.get("content", "")
-                        break
-                    elif task_status == "failed":
-                        raise Exception(
-                            f"AI processing failed: {status.get('error', 'Task failed')}"
-                        )
-                except Exception as poll_error:
-                    debug_print(f"[GoPilot] Polling error: {poll_error}")
-                    continue
-
-            if not message_content:
-                messages = self.client.gopilot.get_messages(self.session_id)
-                if messages:
-                    for msg in reversed(messages):
-                        is_assistant = (
-                            msg.get("role") == "assistant"
-                            or msg.get("is_user") is False
-                        )
-                        if is_assistant:
-                            message_content = msg.get("content", "")
-                            if message_content:
-                                break
-                if not message_content:
-                    raise Exception(
-                        "AI response timeout. Check the chat history.")
-
-            self.finished.emit({
-                "session_id": self.session_id,
-                "task_id": task_id,
-                "message": message_content,
-            })
-        except Exception as e:
-            import traceback
-            error_trace = traceback.format_exc()
-            debug_print(f"[GoPilot] Error in SendMessageThread: {error_trace}")
-
-            # Extract more details from HTTP errors
-            error_msg = str(e)
-            if hasattr(e, 'response'):
-                try:
-                    error_details = e.response.json()
-                    error_msg = f"{error_msg}\nDetails: {error_details}"
-                except Exception:
-                    try:
-                        error_msg = f"{error_msg}\nResponse: {e.response.text[:200]}"
-                    except Exception as detail_exc:
-                        # Response body was unreadable; keep the base error message.
-                        debug_print(
-                            f"[GoPilot] Could not read error response body: {detail_exc}")
-
-            self.error.emit(error_msg)
-
-
-class FetchChatsThread(QThread):
-    finished = pyqtSignal(list)
-    error = pyqtSignal(str)
-
-    def __init__(self, client):
-        super().__init__()
-        self.client = client
-
-    def run(self):
-        try:
-            if not self.client.gopilot:
-                raise Exception("GoPilot client not initialized")
-            history = self.client.gopilot.get_session_history()
-            chats = []
-            for s in history.get("results", []):
-                chats.append({
-                    "id": s.get("id"),
-                    "title": s.get("title", "Untitled Chat"),
-                    "timestamp": s.get("created_at", "")[:16].replace("T", " "),
-                })
-            self.finished.emit(chats)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class FetchMessagesThread(QThread):
-    finished = pyqtSignal(list)
-    error = pyqtSignal(str)
-
-    def __init__(self, client, session_id):
-        super().__init__()
-        self.client = client
-        self.session_id = session_id
-
-    def run(self):
-        try:
-            if not self.client.gopilot:
-                raise Exception("GoPilot client not initialized")
-            self.finished.emit(
-                self.client.gopilot.get_messages(self.session_id))
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class DeleteChatThread(QThread):
-    finished = pyqtSignal()
-    error = pyqtSignal(str)
-
-    def __init__(self, client, session_id):
-        super().__init__()
-        self.client = client
-        self.session_id = session_id
-
-    def run(self):
-        try:
-            if not self.client.gopilot:
-                raise Exception("GoPilot client not initialized")
-            self.client.gopilot.delete_session(self.session_id)
-            self.finished.emit()
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-# ══════════════════════════════ Message bubble ═══════════════════════════════
-class MessageBubble(QFrame):
-    """A single chat bubble.
-
-    Body is a word-wrapped QLabel that sizes its own height — no manual
-    height syncing, no internal scrollbar, no refresh hacks.
+    A ``QFrame`` rather than a ``QPushButton`` because a button draws ONE
+    string in ONE style. This needs a title and a description at different
+    sizes and weights, both word-wrapped, next to a tinted badge — so the card
+    is a frame of real labels and supplies the button behaviour itself
+    (pointer cursor, hover wash, click signal).
     """
 
-    BUBBLE_MAX_WIDTH = 560
-    _BODY_PAD = 28  # horizontal padding inside the bubble (14 + 14)
+    clicked = pyqtSignal()
 
-    def __init__(self, text, role="ai", with_time=True, timestamp=None, client=None, has_attachment=False, parent=None):
+    BADGE = 26
+    TEXT_SPACING = 2
+
+    def __init__(self, icon_name, title, description, prompt=None,
+                 parent=None):
         super().__init__(parent)
-        self.role = role
-        self.client = client
-        self._download_threads = []
-        self._has_attachment = has_attachment
+        self.title = title
+        # What gets SENT, which the API keeps separate from what the card
+        # SHOWS: `prompt_text` can be a paragraph of instruction standing
+        # behind a six-word label. Falls back to the title for the static set,
+        # whose titles were written to be sendable as they are.
+        self.prompt = prompt or title
+        self.setObjectName("suggestionCard")
+        self.setCursor(Qt_PointingHandCursor)
+        self.setToolTip(description)
+        enable_height_for_width(self)
 
-        if role == "user":
-            bg, fg, border = theme_utils.BRAND_PRIMARY, "#ffffff", theme_utils.BRAND_PRIMARY
-            self._dark_text = False
-        elif role == "system":
-            bg = theme_utils.get_hover_bg()
-            fg = theme_utils.get_secondary_text_color()
-            border = "transparent"
-            self._dark_text = True
-        else:  # ai
-            bg = theme_utils.get_card_bg()
-            fg = theme_utils.get_text_color()
-            border = theme_utils.get_card_border()
-            self._dark_text = True
+        t = design.tokens()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 9, 11, 9)
+        lay.setSpacing(design.SPACE_2)
 
-        self.setObjectName("bubble")
-        self.setFrameShape(QFrame_StyledPanel)
-        self.setMaximumWidth(self.BUBBLE_MAX_WIDTH)
+        badge = QLabel()
+        badge.setFixedSize(self.BADGE, self.BADGE)
+        badge.setAlignment(Qt_AlignCenter)
+        badge.setPixmap(icons.pixmap(icon_name, 14, t.accent, dpr=2.0))
+        badge.setStyleSheet(
+            f"background:{t.accent_soft}; border:none; "
+            f"border-radius:{design.RADIUS_SM}px;"
+        )
+        # Centred, not top-aligned: every card is padded to the height of the
+        # tallest one (see _SuggestionGrid._equalise_heights), so a top-aligned
+        # badge on a one-line card would float away from the text beside it.
+        lay.addWidget(badge, alignment=Qt_AlignVCenter)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(self.TEXT_SPACING)
+        # Stretches so the title+description block sits in the vertical centre
+        # of whatever height the card has been padded to.
+        text_col.addStretch()
+
+        self._title = WrappedLabel(title)
+        self._title.setAlignment(Qt_AlignCenter)
+        self._title.setStyleSheet(
+            f"background:transparent; border:none; color:{t.text}; "
+            f"font-family:{design.FONT_STACK}; font-size:{design.TEXT_BASE}px; "
+            f"font-weight:{design.WEIGHT_SEMIBOLD};"
+        )
+        text_col.addWidget(self._title)
+
+        self._description = WrappedLabel(description)
+        self._description.setAlignment(Qt_AlignCenter)
+        self._description.setStyleSheet(
+            f"background:transparent; border:none; color:{t.text_muted}; "
+            f"font-family:{design.FONT_STACK}; font-size:{design.TEXT_SM}px;"
+        )
+        text_col.addWidget(self._description)
+        text_col.addStretch()
+        lay.addLayout(text_col, stretch=1)
+
+        self._apply_style(hover=False)
+
+    def required_height(self):
+        """Height this card needs for its own text at its current width.
+
+        Read from the labels' pinned minimum heights rather than from
+        ``sizeHint()``: a wrapped label's sizeHint is computed at a width Qt
+        chooses heuristically, not the width the label actually has, so two
+        cards with the same real wrapping reported different hints (78 vs 63).
+        :class:`~.widgets.WrappedLabel` maintains an exact minimum height for
+        the width it is really at, which is the honest number.
+        """
+        margins = self.layout().contentsMargins()
+        text = (self._title.minimumHeight() + self.TEXT_SPACING
+                + self._description.minimumHeight())
+        content = margins.top() + margins.bottom() + max(self.BADGE, text)
+        # Plus the BORDER. `_apply_style` draws a 1px border, and a styled
+        # border is part of the frame, so Qt reserves it outside the layout's
+        # content rect: the layout wanted 70px here while the card the layout
+        # produced was 72. Omitting it made this figure 2px short of the real
+        # height, so the uniform minimum handed to every card was 2px under
+        # what the tallest of them actually took — the tall cards overshot it
+        # and only the one short card sat at it. That is the "six cards, two
+        # heights" this is supposed to prevent.
+        return content + 2 * self.frameWidth()
+
+    def _apply_style(self, hover):
+        t = design.tokens()
         self.setStyleSheet(f"""
-            QFrame#bubble {{
-                background: {bg};
-                border: 1px solid {border};
-                border-radius: 14px;
+            QFrame#suggestionCard {{
+                background: {t.accent_soft if hover else t.surface};
+                border: 1px solid {t.accent if hover else t.border};
+                border-radius: {design.RADIUS}px;
             }}
         """)
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 10, 14, 10)
-        lay.setSpacing(3)
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._apply_style(hover=True)
 
-        self._body = QLabel()
-        self._body.setWordWrap(True)
-        self._body.setTextFormat(_RICH_TEXT)
-        self._body.setOpenExternalLinks(True)
-        self._body.setMaximumWidth(self.BUBBLE_MAX_WIDTH - self._BODY_PAD)
-        if _SELECTABLE is not None and _LINKS is not None:
-            self._body.setTextInteractionFlags(_SELECTABLE | _LINKS)
-        self._body.setStyleSheet(
-            f"color:{fg}; font-size:13px; background:transparent; border:none;"
-        )
-        lay.addWidget(self._body)
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        self._apply_style(hover=False)
 
-        # Show attachment indicator for user messages with files
-        if role == "user" and has_attachment:
-            attachment_label = QLabel("📎 GeoJSON attached")
-            attachment_label.setStyleSheet(
-                f"color:{fg}; font-size:11px; background:transparent; "
-                f"border:none; font-style:italic; margin-top:4px;"
-            )
-            attachment_label.setAlignment(Qt_AlignRight)
-            lay.addWidget(attachment_label)
+    def mouseReleaseEvent(self, event):
+        # Release, not press: a click is only a click if the pointer is still
+        # on the card, so dragging off it cancels, as a button would.
+        if event.button() == Qt_LeftButton and self.rect().contains(
+                event.pos()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
 
-        # Container for download buttons (will be populated when content is set)
-        self._download_layout = QVBoxLayout()
-        self._download_layout.setSpacing(4)
-        self._download_layout.setContentsMargins(0, 8, 0, 0)  # Add top padding
-        lay.addLayout(self._download_layout)
 
-        if with_time and role != "system":
-            # Use provided timestamp or current time
-            time_str = timestamp if timestamp else QDateTime.currentDateTime().toString("hh:mm")
-            t = QLabel(time_str)
-            t.setStyleSheet(
-                f"color:{fg}; font-size:10px; background:transparent; border:none;"
-            )
-            t.setAlignment(Qt_AlignRight if role == "user" else Qt_AlignLeft)
-            # Slightly dim the timestamp without a second color lookup.
-            t.setProperty("class", "ts")
-            lay.addWidget(t)
+class _SuggestionGrid(QWidget):
+    """The openers, in one or two columns depending on the width available.
 
-        self.set_content(text)
+    Two columns is the shape of the design, but it is not affordable at every
+    size: the panel's content column is ~374px at the default dock width, which
+    would leave each card about 140px for its text and wrap
+    "Map buildings within 2 km of the Eiffel Tower" over five lines. So the
+    grid reflows — one column when docked narrow, two once there is room for
+    both to stay readable (undocked, or a widened dock).
 
-    def set_content(self, text):
-        """Replace the body text. Safe to call repeatedly while streaming.
+    Mirrors the SaaS, whose own suggestion grid is ``grid-cols-1
+    sm:grid-cols-2``.
+    """
 
-        File links are replaced by one control per file in ``_download_layout``
-        at the end of the bubble, just above the timestamp.
-        """
-        # Clear existing download buttons / inline images
-        while self._download_layout.count():
-            item = self._download_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+    # Two cards plus the gap, at the ~230px each needs to read comfortably.
+    TWO_COLUMN_MIN = 470
 
-        files = _extract_file_urls(text)
-        display_text = text
-        for url, _, _, _ in files:
-            display_text = re.sub(
-                r'\[[^\]]+\]\(<?' + re.escape(url) + r'>?\)', '',
-                display_text)
-            display_text = display_text.replace(url, '')
-        display_text = re.sub(
-            r'(?m)^[ \t]*[-*+][ \t]*$', '', display_text)
+    def __init__(self, items, parent=None):
+        super().__init__(parent)
+        paint_transparent(self)
+        enable_height_for_width(self)
 
-        self._body.setText(
-            _render_body_html(display_text, dark_text=self._dark_text)
-        )
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setHorizontalSpacing(design.SPACE_2)
+        self._grid.setVerticalSpacing(design.SPACE_2)
 
-        # Append one control per detected file link, at the end of the bubble.
-        # (Only for AI messages that have a client capable of downloading.)
-        if self.role == "ai" and self.client:
-            for url, filename, ext, is_image in files:
-                # Images render as an inline preview (with a save button);
-                # every other file type gets a download/install button.
-                if is_image:
-                    self._add_inline_image(url, filename)
-                else:
-                    self._add_download_button(url, filename, ext)
+        # Items are (icon, title, description) or
+        # (icon, title, description, prompt_text).
+        self.cards = [_SuggestionCard(*item) for item in items]
+        self._columns = 0
+        self._card_height = 0
+        self._reflow(1)
 
-    def _add_download_button(self, url, filename, ext):
-        """Add a download button for a file URL"""
-        btn = QPushButton(f"📥 Download {filename}")
-        btn.setCursor(Qt_PointingHandCursor)
-        btn.setMaximumWidth(self.BUBBLE_MAX_WIDTH - self._BODY_PAD)
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {theme_utils.BRAND_PRIMARY};
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-size: 12px;
-                text-align: left;
-            }}
-            QPushButton:hover {{
-                background: {theme_utils.BRAND_HOVER};
-            }}
-            QPushButton:disabled {{
-                background: {theme_utils.get_hover_bg()};
-                color: {theme_utils.get_secondary_text_color()};
-            }}
-        """)
-        btn.clicked.connect(
-            lambda: self._download_and_load(url, filename, btn))
-        self._download_layout.addWidget(btn)
-
-    def _download_and_load(self, url, filename, button):
-        """Download file and load it into QGIS"""
-        if not self.client:
-            QMessageBox.warning(
-                self, "Error", "Cannot download: client not available")
+    def _reflow(self, columns):
+        if columns == self._columns:
             return
+        self._columns = columns
+        for card in self.cards:
+            self._grid.removeWidget(card)
+        for index, card in enumerate(self.cards):
+            self._grid.addWidget(card, index // columns, index % columns)
+        # Equal columns, and clear any stretch left from the previous shape.
+        for column in range(2):
+            self._grid.setColumnStretch(column, 1 if column < columns else 0)
 
-        button.setText("⏳ Downloading...")
-        button.setEnabled(False)
+    def _equalise_heights(self):
+        """Give every card the height of the tallest one.
 
-        thread = DownloadLayerThread(self.client, url, filename)
-        thread.finished.connect(
-            lambda path: self._on_download_complete(path, filename, button))
-        thread.error.connect(lambda msg: self._on_download_error(msg, button))
-        self._download_threads.append(thread)
-        thread.start()
+        A grid equalises each ROW, not the whole set, so with one column every
+        card kept its own height and with two the rows stepped against each
+        other — six cards at four different heights. Uniform height makes the
+        set read as one block of options rather than a ragged list, and it is
+        what the design calls for.
 
-    def _on_download_complete(self, filepath, filename, button):
-        """Handle successful download"""
-        try:
-            # Remove extension for layer name
-            layer_name = filename.rsplit('.', 1)[0]
-            _add_layer_to_qgis(filepath, layer_name)
-            button.setText(f"✅ Loaded: {filename}")
-            button.setEnabled(False)
-        except Exception as e:
-            QMessageBox.warning(self, "Load Error",
-                                f"Downloaded but failed to load:\n{e}")
-            button.setText(f"⚠️ Load failed: {filename}")
-            button.setEnabled(True)
-
-    def _on_download_error(self, error_msg, button):
-        """Handle download error"""
-        box = QMessageBox(self)
-        box.setWindowTitle("Download Error")
-        box.setIcon(QMessageBox_Warning)
-        box.setText(f"Failed to download:\n{error_msg}")
-        box.setStandardButtons(QMessageBox_Ok)
-        box.setStyleSheet(
-            f"QLabel, QPushButton {{ color: {theme_utils.get_text_color()}; }}")
-        exec_dialog(box)
-        button.setText("🔄 Retry Download")
-        button.setEnabled(True)
-
-    def _add_inline_image(self, url, filename):
-        """Add an inline image preview plus an always-present save button.
-
-        The save button is added immediately — not only after a successful
-        load — so every image link always ends up with a working control at
-        the end of the bubble, even if the preview itself fails to load (for
-        example an expired or signature-sensitive presigned URL).
+        Re-run whenever the width changes, because wrapping — and therefore
+        the tallest card — changes with it.
         """
-        # Image preview placeholder
-        img_label = QLabel()
-        img_label.setAlignment(Qt_AlignCenter)
-        img_label.setMaximumWidth(self.BUBBLE_MAX_WIDTH - self._BODY_PAD)
-        img_label.setText("🖼️ Loading image...")
-        img_label.setStyleSheet(
-            f"background:{theme_utils.get_hover_bg()}; "
-            f"padding:8px; border-radius:6px; color:{theme_utils.get_secondary_text_color()};"
-        )
-        self._download_layout.addWidget(img_label)
-
-        # Always add the save button up front so it is present regardless of
-        # whether the preview loads.
-        from functools import partial
-        download_btn = QPushButton(f"💾 Save {filename}")
-        download_btn.setCursor(Qt_PointingHandCursor)
-        download_btn.setMaximumWidth(self.BUBBLE_MAX_WIDTH - self._BODY_PAD)
-        download_btn.setStyleSheet(f"""
-            QPushButton {{
-                background:{theme_utils.get_card_bg()};
-                color:{theme_utils.get_text_color()};
-                border:1px solid {theme_utils.get_card_border()};
-                border-radius:6px;
-                padding:6px 10px;
-                font-size:11px;
-                text-align:center;
-            }}
-            QPushButton:hover {{
-                background:{theme_utils.get_hover_bg()};
-                border-color:{theme_utils.BRAND_PRIMARY};
-            }}
-        """)
-        download_btn.clicked.connect(
-            partial(self._save_image_locally, url, filename))
-        self._download_layout.addWidget(download_btn)
-
-        # Download the preview. Use QUrl.fromEncoded so an already
-        # percent-encoded presigned URL (e.g. AWS S3 with %2F in the
-        # credential) is NOT re-encoded — re-encoding would corrupt the
-        # signature and return 403.
-        if not hasattr(self, '_network_managers'):
-            self._network_managers = []
-        network_manager = QNetworkAccessManager(self)
-        self._network_managers.append(network_manager)
-        request = QNetworkRequest(QUrl.fromEncoded(url.encode('utf-8')))
-
-        def on_image_loaded():
-            # Get reply from sender
-            reply = network_manager.sender()
-            if not reply:
-                img_label.setText(f"❌ Preview unavailable: {filename}")
-                return
-
-            # Check for errors. A 403 on a presigned S3 URL almost always
-            # means the link's validity window (e.g. "valid 7 days") has
-            # elapsed, so call that out specifically instead of a generic
-            # failure.
-            if reply.error():
-                status = (
-                    reply.attribute(_HTTP_STATUS_ATTR)
-                    if _HTTP_STATUS_ATTR is not None else None
-                )
-                if status == 403:
-                    img_label.setText(f"⚠️ Link expired: {filename}")
-                else:
-                    img_label.setText(f"❌ Preview unavailable: {filename}")
-                reply.deleteLater()
-                return
-
-            try:
-                # Load image data
-                image_data = reply.readAll()
-                pixmap = QPixmap()
-                if pixmap.loadFromData(image_data):
-                    # Scale to fit bubble width
-                    max_width = self.BUBBLE_MAX_WIDTH - self._BODY_PAD - 16
-                    if pixmap.width() > max_width:
-                        pixmap = pixmap.scaledToWidth(
-                            max_width, Qt_SmoothTransformation)
-
-                    # Limit height to 400px
-                    if pixmap.height() > 400:
-                        pixmap = pixmap.scaledToHeight(
-                            400, Qt_SmoothTransformation)
-
-                    img_label.setPixmap(pixmap)
-                    img_label.setText("")
-                    img_label.setStyleSheet(
-                        "background:transparent; padding:4px; border-radius:6px;"
-                    )
-                else:
-                    img_label.setText(f"❌ Failed to decode image: {filename}")
-            except Exception as e:
-                img_label.setText(f"❌ Error loading image: {str(e)}")
-            finally:
-                # Clean up reply
-                reply.deleteLater()
-
-        reply = network_manager.get(request)
-        reply.finished.connect(on_image_loaded)
-
-    def _save_image_locally(self, url, filename):
-        """Save image to local disk"""
-        from qgis.PyQt.QtWidgets import QFileDialog
-        import os
-
-        # Ask user where to save
-        default_path = os.path.join(
-            os.path.expanduser("~"), "Downloads", filename)
-        save_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Save Image",
-            default_path,
-            "Images (*.png *.jpg *.jpeg)"
-        )
-
-        if not save_path:
+        if not self.cards:
             return
+        tallest = max(card.required_height() for card in self.cards)
+        if tallest <= 0 or tallest == self._card_height:
+            return
+        self._card_height = tallest
+        for card in self.cards:
+            # A MINIMUM, not a fixed height. required_height() reads the
+            # labels' pinned minimums, which are only correct once they have
+            # been laid out — so if this runs early the figure can come out
+            # short. A minimum degrades to "not quite level"; a fixed height
+            # would crush the text on top of the badge.
+            card.setMinimumHeight(tallest)
 
-        # Download and save
-        try:
-            thread = DownloadLayerThread(self.client, url)
-            thread.finished.connect(
-                lambda temp_path: self._on_image_saved(
-                    temp_path, save_path, filename)
-            )
-            thread.error.connect(
-                lambda msg: QMessageBox.warning(
-                    self, "Save Error", f"Failed to save image:\n{msg}")
-            )
-            self._download_threads.append(thread)
-            thread.start()
-        except Exception as e:
-            QMessageBox.warning(self, "Save Error",
-                                f"Failed to save image:\n{str(e)}")
-
-    def _on_image_saved(self, temp_path, save_path, filename):
-        """Handle image saved to disk"""
-        import shutil
-        try:
-            shutil.move(temp_path, save_path)
-            # Note: Can't access parent page's status_label, so just show message box on error
-        except Exception as e:
-            QMessageBox.warning(self, "Save Error",
-                                f"Failed to move image:\n{str(e)}")
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._reflow(2 if self.width() >= self.TWO_COLUMN_MIN else 1)
+        # Deferred by one turn of the event loop: the cards' labels pin their
+        # own heights from THEIR resizeEvent, which has not run yet at this
+        # point, so measuring now would read the previous width's wrapping.
+        QTimer.singleShot(0, self._equalise_heights)
 
 
-# ══════════════════════════════ Main page ════════════════════════════════════
 class GoPilotPage(QWidget):
-    """GoPilot AI Chat interface (Option 3: QLabel-per-message)."""
+    """The chat view. Owns one conversation at a time."""
+
+    session_changed = pyqtSignal(str)       # a new/opened session id
+    history_changed = pyqtSignal()          # the session list needs reloading
+    busy_changed = pyqtSignal(bool)
 
     def __init__(self, client, iface=None, parent=None):
         super().__init__(parent)
@@ -848,326 +304,665 @@ class GoPilotPage(QWidget):
         self.iface = iface
         self.current_chat_id = None
         self._threads = []
-        self._welcome_widget = None
+        self._bubbles = []
+        self._empty_state = None
         self._thinking_row = None
+        self._live_bubble = None
+        self._live_thinking = None
+        self._live_tool_calls = None
+        self._fetched_suggestions = None
+        self._suggestions_requested = False
+        self._limits_requested = False
+        self._suggestion_grid = None
         self._streaming_bubble = None
-        self._attached_geojson = None  # Store drawn/selected geometry
 
-        # Initialize geometry input manager
         self.geo_manager = GeometryInputManager(iface, parent_widget=self)
         self.geo_manager.geometry_ready.connect(self._on_geometry_ready)
+        self.geo_manager.draw_cancelled.connect(
+            lambda: self._set_status("", busy=False))
 
-        main = QHBoxLayout(self)
-        main.setContentsMargins(0, 0, 0, 0)
-        main.setSpacing(0)
+        t = design.tokens()
+        paint_background(self, t.canvas, "gopilotChatPage")
 
-        splitter = QSplitter(Qt_Horizontal)
-        splitter.addWidget(self._create_history_panel())
-        splitter.addWidget(self._create_chat_panel())
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 7)
-        main.addWidget(splitter)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        self.load_chat_history()
-        self._show_greeting()
+        self._scroll = styled_scroll_area()
+        self._transcript = QWidget()
+        paint_transparent(self._transcript)
+        self._messages = QVBoxLayout(self._transcript)
+        self._messages.setContentsMargins(design.SPACE_3, design.SPACE_3,
+                                          design.SPACE_3, design.SPACE_3)
+        self._messages.setSpacing(design.SPACE_2)
+        self._messages.addStretch()
+        self._scroll.setWidget(self._transcript)
+        root.addWidget(self._scroll, stretch=1)
 
-    # ── left sidebar ──────────────────────────────────────────────────────────
-    def _create_history_panel(self):
-        panel = QFrame()
-        panel.setMinimumWidth(200)
-        pbg = theme_utils.get_sidebar_bg()
-        pborder = theme_utils.get_sidebar_border()
-        panel.setStyleSheet(
-            f"QFrame {{ background:{pbg}; border-right:1px solid {pborder}; }}"
+        root.addWidget(self._build_status_strip())
+
+        self.composer = Composer()
+        self.composer.submitted.connect(self._on_submit)
+        self.composer.layer_requested.connect(self.pick_layer)
+        self.composer.draw_requested.connect(self.start_draw)
+        root.addWidget(self.composer)
+
+        self.start_new_chat()
+
+    # ── chrome ────────────────────────────────────────────────────────────────
+    def _build_status_strip(self):
+        """A thin strip that appears only while something is happening."""
+        t = design.tokens()
+        self._status_host = QFrame()
+        self._status_host.setObjectName("statusStrip")
+        self._status_host.setStyleSheet(
+            f"QFrame#statusStrip {{ background:{t.accent_soft}; "
+            f"border:none; border-top:1px solid {t.accent_soft_border}; }}"
         )
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(12, 16, 12, 16)
-        lay.setSpacing(12)
+        lay = QHBoxLayout(self._status_host)
+        lay.setContentsMargins(design.SPACE_3, 5, design.SPACE_3, 5)
+        lay.setSpacing(design.SPACE_2)
 
-        header = QLabel("Chat History")
-        header.setStyleSheet(
-            f"font-size:16px; font-weight:bold; color:{theme_utils.get_text_color()}; "
-            f"border:none; background:transparent;"
+        self._status_icon = QLabel()
+        self._status_icon.setPixmap(
+            icons.pixmap("sparkle", 13, t.accent_text, dpr=2.0))
+        paint_transparent(self._status_icon, border=True)
+        lay.addWidget(self._status_icon)
+
+        self._status_label = QLabel("")
+        self._status_label.setStyleSheet(
+            f"background:transparent; border:none; color:{t.accent_text}; "
+            f"font-family:{design.FONT_STACK}; font-size:{design.TEXT_SM}px; "
+            f"font-weight:{design.WEIGHT_MEDIUM};"
         )
-        lay.addWidget(header)
+        lay.addWidget(self._status_label, stretch=1)
+        self._status_host.setVisible(False)
+        return self._status_host
 
-        self.btn_new_chat = QPushButton("+ New Chat")
-        self.btn_new_chat.setCursor(Qt_PointingHandCursor)
-        self.btn_new_chat.setAutoDefault(False)  # Prevent Enter key capture
-        self.btn_new_chat.setStyleSheet(f"""
-            QPushButton {{
-                background:{theme_utils.BRAND_PRIMARY}; color:white; border:none;
-                border-radius:6px; padding:10px; font-size:13px; font-weight:bold;
-            }}
-            QPushButton:hover {{ background:{theme_utils.BRAND_HOVER}; }}
-        """)
-        self.btn_new_chat.clicked.connect(self.start_new_chat)
-        lay.addWidget(self.btn_new_chat)
+    def _set_status(self, text, busy=None):
+        """Show (or hide, when ``text`` is empty) the status strip."""
+        self._status_label.setText(text or "")
+        self._status_host.setVisible(bool(text))
+        if busy is not None:
+            self.composer.set_busy(busy)
+            self.busy_changed.emit(busy)
 
-        self.chat_list = QListWidget()
-        self.chat_list.setFrameShape(QFrame_NoFrame)
-        self.chat_list.setStyleSheet(f"""
-            QListWidget {{
-                background:{theme_utils.get_card_bg()};
-                border:1px solid {pborder}; border-radius:6px;
-                color:{theme_utils.get_text_color()}; font-size:12px; padding:4px;
-            }}
-            QListWidget::item {{ padding:2px; border-radius:4px; margin:2px 0; }}
-            QListWidget::item:hover {{ background:{theme_utils.get_hover_bg()}; }}
-            QListWidget::item:selected {{
-                background:{theme_utils.BRAND_PRIMARY}; color:white;
-            }}
-        """)
-        lay.addWidget(self.chat_list)
-        return panel
-
-    # ── right chat panel ──────────────────────────────────────────────────────
-    def _create_chat_panel(self):
-        panel = QFrame()
-        panel.setStyleSheet(f"background:{theme_utils.get_card_bg()};")
-        lay = QVBoxLayout(panel)
-        lay.setContentsMargins(20, 20, 20, 20)
-        lay.setSpacing(12)
-
-        head = QHBoxLayout()
-        head.setSpacing(12)
-        title = QLabel("GoPilot")
-        title.setStyleSheet(
-            f"font-size:20px; font-weight:bold; color:{theme_utils.get_text_color()}; "
-            f"border:none; background:transparent;"
-        )
-        head.addWidget(title)
-        head.addStretch()
-        self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet(
-            f"font-size:12px; color:{theme_utils.get_secondary_text_color()}; "
-            f"border:none; background:transparent;"
-        )
-        head.addWidget(self.status_label)
-        lay.addLayout(head)
-
-        desc = QLabel("Ask me anything about geospatial analysis and earth "
-                      "observation I can automate anything for you!")
-        desc.setWordWrap(True)
-        desc.setStyleSheet(
-            f"font-size:13px; color:{theme_utils.get_secondary_text_color()}; "
-            f"border:none; background:transparent; margin-bottom:8px;"
-        )
-        lay.addWidget(desc)
-
-        # Scrollable message area.
-        self.chat_scroll = QScrollArea()
-        self.chat_scroll.setWidgetResizable(True)
-        self.chat_scroll.setFrameShape(QFrame_NoFrame)
-        self.chat_scroll.setStyleSheet(f"""
-            QScrollArea {{
-                background:{theme_utils.get_sidebar_bg()};
-                border:1px solid {theme_utils.get_card_border()};
-                border-radius:8px;
-            }}
-        """)
-        self.messages_widget = QWidget()
-        self.messages_widget.setStyleSheet("background:transparent;")
-        self.messages_layout = QVBoxLayout(self.messages_widget)
-        self.messages_layout.setContentsMargins(14, 14, 14, 14)
-        self.messages_layout.setSpacing(8)
-        self.messages_layout.addStretch()  # trailing stretch keeps msgs top-aligned
-        self.chat_scroll.setWidget(self.messages_widget)
-        lay.addWidget(self.chat_scroll)
-
-        # Input row.
-        row = QHBoxLayout()
-        row.setSpacing(8)
-
-        # Draw button (only if iface available)
-        if self.iface:
-            self.btn_draw = QPushButton("🖊️")
-            self.btn_draw.setCursor(Qt_PointingHandCursor)
-            self.btn_draw.setFixedSize(44, 44)
-            self.btn_draw.setToolTip("Draw geometry on map")
-            self.btn_draw.setAutoDefault(False)  # Prevent Enter key capture
-            self.btn_draw.setStyleSheet(f"""
-                QPushButton {{
-                    background:{theme_utils.get_card_bg()};
-                    border:2px solid {theme_utils.get_card_border()};
-                    border-radius:8px; font-size:18px;
-                }}
-                QPushButton:hover {{
-                    background:{theme_utils.get_hover_bg()};
-                    border-color:{theme_utils.BRAND_PRIMARY};
-                }}
-            """)
-            self.btn_draw.clicked.connect(self._start_draw_geometry)
-            row.addWidget(self.btn_draw)
-
-            # Layer picker button
-            self.btn_layer = QPushButton("📐")
-            self.btn_layer.setCursor(Qt_PointingHandCursor)
-            self.btn_layer.setFixedSize(44, 44)
-            self.btn_layer.setToolTip("Select layer from QGIS")
-            self.btn_layer.setAutoDefault(False)  # Prevent Enter key capture
-            self.btn_layer.setStyleSheet(f"""
-                QPushButton {{
-                    background:{theme_utils.get_card_bg()};
-                    border:2px solid {theme_utils.get_card_border()};
-                    border-radius:8px; font-size:18px;
-                }}
-                QPushButton:hover {{
-                    background:{theme_utils.get_hover_bg()};
-                    border-color:{theme_utils.BRAND_PRIMARY};
-                }}
-            """)
-            self.btn_layer.clicked.connect(self._pick_layer)
-            row.addWidget(self.btn_layer)
-
-        self.message_input = QLineEdit()
-        self.message_input.setPlaceholderText("Type your message here...")
-        self.message_input.setStyleSheet(f"""
-            QLineEdit {{
-                background:{theme_utils.get_card_bg()};
-                color:{theme_utils.get_text_color()};
-                border:2px solid {theme_utils.get_card_border()};
-                border-radius:8px; padding:12px 16px; font-size:13px;
-            }}
-            QLineEdit:focus {{ border:2px solid {theme_utils.BRAND_PRIMARY}; }}
-        """)
-        self.message_input.returnPressed.connect(self.send_message)
-        row.addWidget(self.message_input)
-
-        self.btn_send = QPushButton("Send")
-        self.btn_send.setCursor(Qt_PointingHandCursor)
-        self.btn_send.setFixedWidth(100)
-        # Make this the default button for Enter key
-        self.btn_send.setDefault(True)
-        self.btn_send.setAutoDefault(True)
-        self.btn_send.setStyleSheet(f"""
-            QPushButton {{
-                background:{theme_utils.BRAND_PRIMARY}; color:white; border:none;
-                border-radius:8px; padding:12px 20px; font-size:13px; font-weight:bold;
-            }}
-            QPushButton:hover {{ background:{theme_utils.BRAND_HOVER}; }}
-            QPushButton:disabled {{
-                background:{theme_utils.get_sidebar_bg()};
-                color:{theme_utils.get_secondary_text_color()};
-            }}
-        """)
-        self.btn_send.clicked.connect(self.send_message)
-        row.addWidget(self.btn_send)
-        lay.addLayout(row)
-        return panel
-
-    # ── message-area helpers ──────────────────────────────────────────────────
-    def _clear_messages(self):
-        while self.messages_layout.count():
-            item = self.messages_layout.takeAt(0)
-            if item is None:
-                break
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        self._welcome_widget = None
+    # ── transcript plumbing ───────────────────────────────────────────────────
+    def _clear_transcript(self):
+        self._bubbles = []
+        self._empty_state = None
         self._thinking_row = None
         self._streaming_bubble = None
+        while self._messages.count():
+            item = self._messages.takeAt(0)
+            if item is None:
+                break
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._messages.addStretch()
+
+    def _bubble_budget(self, role):
+        """Max bubble width for ``role`` at the current viewport width."""
+        viewport = self._scroll.viewport()
+        width = viewport.width() if viewport is not None else self.width()
+        # Minus the transcript's own horizontal padding.
+        usable = max(MessageBubble.MIN_WIDTH, width - design.SPACE_3 * 2 - 2)
+        return usable if role != "user" else int(usable * 0.86)
 
     def _add_bubble(self, bubble, side):
-        """Insert a bubble in an alignment row, before the trailing stretch.
+        """Insert ``bubble`` in an alignment row, before the trailing stretch.
 
-        `side` is "left", "right", or "center". Wrapping the bubble in an
-        HBox with a stretch on the opposite side is the most reliable way to
-        pin alignment AND let the bubble hug its content width.
+        Wrapping it in an HBox with a stretch on the opposite side is the one
+        reliable way to pin alignment AND let the bubble hug its content width:
+        a layout alignment flag alone makes it claim the full row.
         """
         row = QWidget()
-        row.setStyleSheet("background:transparent;")
-        hb = QHBoxLayout(row)
-        hb.setContentsMargins(0, 0, 0, 0)
-        hb.setSpacing(0)
+        paint_transparent(row)
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
         if side == "right":
-            hb.addStretch()
-            hb.addWidget(bubble)
+            lay.addStretch()
+            lay.addWidget(bubble)
         elif side == "center":
-            hb.addStretch()
-            hb.addWidget(bubble)
-            hb.addStretch()
-        else:  # left
-            hb.addWidget(bubble)
-            hb.addStretch()
+            lay.addStretch()
+            lay.addWidget(bubble)
+            lay.addStretch()
+        else:
+            lay.addWidget(bubble)
+            lay.addStretch()
 
-        insert_at = max(0, self.messages_layout.count() - 1)  # before stretch
-        self.messages_layout.insertWidget(insert_at, row)
+        bubble.set_max_width(self._bubble_budget(bubble.role))
+        self._bubbles.append(bubble)
+        self._messages.insertWidget(max(0, self._messages.count() - 1), row)
+        # Deferred: the bubble has not been laid out yet, so its height (and
+        # therefore the scroll maximum) is not known until the event loop turns.
         QTimer.singleShot(0, self._scroll_to_bottom)
         return row
 
-    def add_message(self, text, is_user=True, timestamp=None, has_attachment=False):
-        role = "user" if is_user else "ai"
-        bubble = MessageBubble(text, role=role, timestamp=timestamp,
-                               client=self.client, has_attachment=has_attachment)
+    def add_message(self, text, is_user=True, timestamp=None,
+                    attachments=None, thinking=None, tool_calls=None,
+                    message_id=None):
+        """Add one message to the transcript.
+
+        ``thinking`` and ``tool_calls`` are what the model did on the way to
+        ``text``. They are parameters rather than something only the live turn
+        can set, because a reopened chat has to render the same thing: the
+        history loader had no way to pass them, so reasoning and tool activity
+        existed only until you navigated away and then were gone for good,
+        even though the API returns them with every message.
+        """
+        bubble = MessageBubble(
+            text, role="user" if is_user else "ai", timestamp=timestamp,
+            client=self.client, iface=self.iface, attachments=attachments,
+            message_id=message_id,
+        )
+        bubble.delete_requested.connect(self._on_delete_message)
+        if not is_user:
+            if thinking:
+                bubble.set_thinking(thinking, streaming=False)
+            if tool_calls:
+                bubble.set_tool_calls(tool_calls, streaming=False)
         return self._add_bubble(bubble, "right" if is_user else "left")
 
-    def _add_system_message(self, text):
-        bubble = MessageBubble(text, role="system",
-                               with_time=False, client=self.client)
+    def _add_system_message(self, text, tone="neutral"):
+        bubble = MessageBubble(text, role="system", with_time=False,
+                               client=self.client, iface=self.iface, tone=tone)
         return self._add_bubble(bubble, "center")
 
-    def _show_greeting(self):
-        self._clear_messages()
-        self.messages_layout.addStretch()  # re-establish trailing stretch
+    def _scroll_to_bottom(self):
+        bar = self._scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
-        greeting = QWidget()
-        greeting.setStyleSheet("background:transparent;")
-        outer = QVBoxLayout(greeting)
-        outer.addStretch()
-        rowc = QHBoxLayout()
-        rowc.addStretch()
-        col = QVBoxLayout()
-        col.setSpacing(10)
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_bubble_widths()
 
-        t = QLabel("\U0001F44B  Welcome to GoPilot")
-        t.setAlignment(Qt_AlignCenter)
-        t.setStyleSheet(
-            f"font-size:22px; font-weight:bold; color:{theme_utils.get_text_color()}; "
-            f"border:none; background:transparent;"
+    def _apply_bubble_widths(self):
+        """Re-cap every bubble after a resize (including a dock drag)."""
+        for bubble in list(self._bubbles):
+            try:
+                bubble.set_max_width(self._bubble_budget(bubble.role))
+            except RuntimeError:
+                # The bubble was deleted by a transcript reload mid-resize.
+                self._bubbles.remove(bubble)
+
+    # ── empty state ───────────────────────────────────────────────────────────
+    def _show_empty_state(self):
+        """Brand, headline, and the openers — the screen every session starts on."""
+        host = QWidget()
+        paint_transparent(host)
+        enable_height_for_width(host)
+        outer = QVBoxLayout(host)
+        outer.setContentsMargins(design.SPACE_2, design.SPACE_5,
+                                 design.SPACE_2, design.SPACE_4)
+        outer.setSpacing(design.SPACE_2)
+
+        # The wordmark lives HERE rather than in a header bar. The panel has no
+        # title bar of its own (see gopilot_dock), so this is where the product
+        # names itself — on the one screen the user always starts from, at the
+        # size a brand deserves, instead of as 14px of chrome they stop seeing
+        # after a day.
+        t = design.tokens()
+        wordmark = QLabel(branding.wordmark_html(t))
+        wordmark.setAlignment(Qt_AlignCenter)
+        wordmark.setStyleSheet(branding.wordmark_qss(design.TEXT_HERO))
+        outer.addWidget(wordmark)
+        outer.addSpacing(design.SPACE_1)
+
+        title = heading("Ask something about Earth", design.TEXT_LG)
+        title.setAlignment(Qt_AlignCenter)
+        outer.addWidget(title)
+
+        subtitle = body_label(
+            "Fetch satellite imagery, detect features, analyse terrain or run "
+            "spatial queries. GoPilot works the map for you.",
+            design.TEXT_BASE, secondary=True,
         )
-        sub = QLabel("Your geospatial intelligence co-pilot.\n"
-                     "Ask me about satellite imagery, Earth observation, "
-                     "or QGIS operations.")
-        sub.setAlignment(Qt_AlignCenter)
-        sub.setWordWrap(True)
-        sub.setMaximumWidth(420)
-        sub.setStyleSheet(
-            f"font-size:13px; color:{theme_utils.get_secondary_text_color()}; "
-            f"border:none; background:transparent;"
-        )
-        col.addWidget(t)
-        col.addWidget(sub)
-        rowc.addLayout(col)
-        rowc.addStretch()
-        outer.addLayout(rowc)
-        outer.addStretch()
+        subtitle.setAlignment(Qt_AlignCenter)
+        outer.addWidget(subtitle)
 
-        # Greeting fills the area, so insert it before the stretch.
-        greeting.setSizePolicy(QSizePolicy_Expanding, QSizePolicy_Expanding)
-        self.messages_layout.insertWidget(0, greeting)
-        self._welcome_widget = greeting
+        outer.addSpacing(design.SPACE_3)
+        grid = _SuggestionGrid(self._suggestion_items())
+        for card in grid.cards:
+            card.clicked.connect(
+                lambda prompt=card.prompt: self._use_prompt(prompt))
+        outer.addWidget(grid)
+        self._suggestion_grid = grid
 
-    def _remove_greeting(self):
-        if self._welcome_widget is not None:
-            self._welcome_widget.deleteLater()
-            self._welcome_widget = None
+        # Centred by a stretch on EITHER side rather than by expanding the host.
+        # Six cards can be taller than the viewport; an expanding host would be
+        # handed the viewport height and squeeze them, while a natural-height
+        # host with stretches around it centres when there is room and lets the
+        # scroll area scroll when there is not.
+        self._messages.insertStretch(0)
+        self._messages.insertWidget(1, host)
+        self._empty_state = host
+        self._fetch_suggestions()
+        self._fetch_upload_limits()
 
-    # ── thinking indicator ────────────────────────────────────────────────────
+    # Server icon names → the plugin's registry. The API sends a lucide name
+    # (the SaaS renders lucide directly); ours is a 33-icon subset drawn in
+    # code, so anything outside it falls back rather than rendering blank.
+    _ICON_ALIASES = {
+        "map": "map-pin", "map-pin": "map-pin", "pin": "map-pin",
+        "layers": "layers", "stack": "layers",
+        "search": "search", "zoom-in": "search", "magnifier": "search",
+        "sparkles": "sparkle", "sparkle": "sparkle", "wand": "sparkle",
+        "alert-triangle": "alert", "alert": "alert", "warning": "alert",
+        "pencil": "draw", "draw": "draw", "edit": "draw",
+        "folder": "projects", "box": "gobox", "upload": "upload",
+        "download": "download", "info": "info", "message": "message",
+        "history": "history", "settings": "settings", "refresh": "refresh",
+    }
+    _ICON_FALLBACK = "sparkle"
+
+    def _suggestion_items(self):
+        """What the empty state's cards should show.
+
+        The API's set if one has been drawn, the static set otherwise. Drawn
+        ONCE per page and cached in ``_fetched_suggestions``: the endpoint
+        picks at random on every call, so refetching would reshuffle the cards
+        under the user's cursor — the same reason the SaaS caches its draw
+        against a key rather than the request.
+        """
+        rows = self._fetched_suggestions
+        if not rows:
+            return SUGGESTIONS
+        items = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            title = (row.get("title") or "").strip()
+            prompt = (row.get("prompt_text") or "").strip() or title
+            if not title and not prompt:
+                continue
+            icon = self._ICON_ALIASES.get(
+                (row.get("icon") or "").strip().lower(), self._ICON_FALLBACK)
+            items.append((icon, title or prompt,
+                          (row.get("description") or "").strip(), prompt))
+        return items or SUGGESTIONS
+
+    def _fetch_upload_limits(self):
+        """Ask the server what may be uploaded, once per page."""
+        if self.client is None or self._limits_requested:
+            return
+        self._limits_requested = True
+        thread = FetchUploadLimitsThread(self.client)
+        thread.finished.connect(self._on_upload_limits)
+        self._threads.append(thread)
+        thread.start()
+
+    def _on_upload_limits(self, limits):
+        if not limits:
+            return      # keep the built-in filter; the server will judge
+        try:
+            self.composer.set_upload_limits(limits)
+        except RuntimeError:
+            pass        # the page went away while the request was in flight
+
+    def _fetch_suggestions(self):
+        """Ask for a draw, once, and rebuild the empty state if it lands."""
+        if self.client is None or self._suggestions_requested:
+            return
+        self._suggestions_requested = True
+        thread = FetchPromptSuggestionsThread(self.client, limit=6)
+        thread.finished.connect(self._on_suggestions)
+        self._threads.append(thread)
+        thread.start()
+
+    def _on_suggestions(self, rows):
+        if not rows:
+            return          # keep the static set; nothing to redraw
+        self._fetched_suggestions = rows
+        # Only rebuild if the empty state is still what the user is looking
+        # at. A draw that lands after they have started typing must not wipe
+        # the transcript they are now in.
+        if self._empty_state is not None:
+            self._remove_empty_state()
+            self._show_empty_state()
+
+    def _use_prompt(self, prompt):
+        """Clicking an opener SENDS it, as it does in the SaaS.
+
+        The card is a promise — its description says what will happen — so
+        typing the text into the composer and stopping there asks the user to
+        confirm a choice they already made, and the one extra click is on a
+        send button they have to go find.
+
+        ``Composer.submit`` is a no-op while a turn is in flight, so the text
+        is placed first and deliberately left behind in that case: the click
+        is not silently dropped, it becomes a filled composer the user can
+        send when the current turn finishes.
+        """
+        self.composer.input.setPlainText(prompt)
+        self.composer.submit()
+        self.composer.focus_input()
+
+    def _remove_empty_state(self):
+        if self._empty_state is None:
+            return
+        # Take the leading stretch that centred it, too. Left behind, it would
+        # keep pushing the first real message down the transcript.
+        leading = self._messages.itemAt(0)
+        if leading is not None and leading.spacerItem() is not None:
+            self._messages.takeAt(0)
+        self._empty_state.setParent(None)
+        self._empty_state.deleteLater()
+        self._empty_state = None
+
+    # ── the in-flight reply ───────────────────────────────────────────────────
     def _show_thinking(self):
-        self._thinking_row = self.add_message(
-            "\U0001F914 Thinking...", is_user=False)
+        """Open the bubble the answer will be written into.
+
+        This used to be a placeholder bubble reading "GoPilot is thinking…",
+        thrown away and replaced by a second bubble when the turn finished. It
+        is now the REAL assistant bubble, created empty and filled in by
+        :meth:`_on_partial` as the task reports progress — which is what makes
+        the answer appear as it is written rather than in one jump at the end.
+        """
+        self._live_thinking = None
+        self._live_tool_calls = None
+        self._thinking_row = self.add_message("", is_user=False)
+        self._live_bubble = self._bubble_in(self._thinking_row)
+        if self._live_bubble is not None:
+            self._live_bubble.set_content("_Thinking…_")
+        return self._thinking_row
+
+    def _bubble_in(self, row):
+        """The :class:`MessageBubble` inside a transcript row, if any."""
+        if row is None:
+            return None
+        layout = row.layout()
+        if layout is None:
+            return None
+        for index in range(layout.count()):
+            candidate = layout.itemAt(index).widget()
+            if isinstance(candidate, MessageBubble):
+                return candidate
+        return None
+
+    def _on_partial(self, message):
+        """Re-render the in-flight answer from a poll's ``llm_message``."""
+        bubble = self._live_bubble
+        if bubble is None:
+            return
+
+        # Sticky: keep the last reasoning and tool list the turn reported.
+        # Each poll re-sends the whole message, and a poll that happens to
+        # omit `thinking_content` would otherwise delete a panel the user is
+        # mid-sentence through reading — the reasoning visibly vanished and
+        # came back. Only a NEW non-empty value replaces the old one.
+        thinking = thinking_text(message.get("thinking_content"))
+        if thinking:
+            self._live_thinking = thinking
+        calls = message.get("tool_calls_content")
+        if calls:
+            self._live_tool_calls = calls
+
+        try:
+            bubble.set_thinking(self._live_thinking, streaming=True)
+            bubble.set_tool_calls(self._live_tool_calls, streaming=True)
+            content = message.get("content") or ""
+            # Keep the placeholder until there is something to replace it
+            # with: a poll during a long reasoning phase carries no content
+            # yet, and blanking the bubble there reads as a failed turn.
+            bubble.set_content(content or "_Thinking…_")
+            bubble.set_max_width(self._bubble_budget(bubble.role))
+        except RuntimeError:
+            # The transcript was reloaded or cleared under us mid-turn.
+            self._live_bubble = None
+            return
+        self._scroll_to_bottom()
 
     def _hide_thinking(self):
+        """Drop the in-flight bubble. Only for turns that produced nothing."""
         if self._thinking_row is not None:
+            bubble = self._bubble_in(self._thinking_row)
+            if bubble in self._bubbles:
+                self._bubbles.remove(bubble)
+            self._thinking_row.setParent(None)
             self._thinking_row.deleteLater()
             self._thinking_row = None
+        self._live_bubble = None
 
-    # ── streaming hooks (ready to wire to a chunked transport) ────────────────
+    # ── sending ───────────────────────────────────────────────────────────────
+    def _on_submit(self, text, files, geojson):
+        if not text and not files and not geojson:
+            return
+        self._remove_empty_state()
+
+        labels = []
+        if geojson:
+            labels.append("Area attached")
+        labels.extend(os.path.basename(path) for path in files)
+        self.add_message(text or "(attachment only)", is_user=True,
+                         attachments=labels or None)
+
+        self._show_thinking()
+        self._set_status("Sending…", busy=True)
+
+        input_metadata = None
+        if geojson:
+            input_metadata = {"type": "vector_upload", "format": "geojson"}
+
+        thread = SendMessageThread(
+            self.client, text, self.current_chat_id,
+            input_metadata=input_metadata, geojson_data=geojson, files=files,
+        )
+        thread.finished.connect(self._on_reply)
+        thread.error.connect(self._on_send_error)
+        thread.partial.connect(self._on_partial)
+        thread.progress.connect(lambda msg: self._set_status(msg))
+        self._threads.append(thread)
+        thread.start()
+
+    def _on_reply(self, response):
+        session_id = response.get("session_id")
+        is_new = not self.current_chat_id and session_id
+        if session_id:
+            self.current_chat_id = str(session_id)
+
+        message = response.get("message", "")
+        llm_message = response.get("llm_message") or {}
+        bubble = self._live_bubble
+
+        if bubble is not None and message:
+            # Finish the bubble the answer has been streaming into, rather
+            # than discarding it and adding a second one — which is what
+            # produced a visible flicker at the end of every turn.
+            try:
+                # The final payload wins where it has something to say,
+                # otherwise what streamed stands — a completed task sometimes
+                # reports only the finished text.
+                bubble.set_thinking(
+                    thinking_text(llm_message.get("thinking_content"))
+                    or self._live_thinking,
+                    streaming=False)
+                bubble.set_tool_calls(
+                    llm_message.get("tool_calls_content")
+                    or self._live_tool_calls, streaming=False)
+                bubble.set_content(message)
+                bubble.set_max_width(self._bubble_budget(bubble.role))
+                # The server only has a row for this reply now, so this is the
+                # earliest its trash control can do anything.
+                bubble.set_message_id(llm_message.get("id"))
+            except RuntimeError:
+                self._hide_thinking()
+                self.add_message(message, is_user=False)
+            self._thinking_row = None
+            self._live_bubble = None
+            self._scroll_to_bottom()
+        else:
+            self._hide_thinking()
+            if message:
+                self.add_message(message, is_user=False)
+        self._set_status("", busy=False)
+        if is_new:
+            # The session only exists server-side once the first turn lands, so
+            # this is the earliest the history list can show it.
+            self.session_changed.emit(self.current_chat_id)
+            self.history_changed.emit()
+
+    def _on_delete_message(self, message_id):
+        """Trash one exchange, after asking.
+
+        The backend moves the whole TURN — a prompt and its reply travel
+        together — so the confirmation says so rather than letting the user
+        discover that their question went with the answer.
+        """
+        confirmed = QMessageBox.question(
+            self, "Delete exchange",
+            "Delete this question and its answer?\n\n"
+            "They move to the trash and can be restored from the web app.",
+            QMessageBox_Yes | QMessageBox_No, QMessageBox_No)
+        if confirmed != QMessageBox_Yes:
+            return
+
+        thread = HideMessageThread(self.client, message_id)
+        thread.finished.connect(self._on_message_deleted)
+        thread.error.connect(
+            lambda msg: self._add_system_message(
+                f"**Could not delete that exchange**\n\n{msg}", tone="error"))
+        self._threads.append(thread)
+        thread.start()
+
+    def _on_message_deleted(self, message_ids):
+        """Remove the bubbles the server actually trashed.
+
+        Driven by the returned ids rather than by the one that was clicked:
+        the backend decides what a turn is, and taking its word keeps the
+        transcript matching the server instead of guessing which sibling went
+        with it.
+        """
+        removed = {int(i) for i in message_ids}
+        for bubble in list(self._bubbles):
+            try:
+                if bubble.message_id is None:
+                    continue
+                if int(bubble.message_id) not in removed:
+                    continue
+            except (RuntimeError, TypeError, ValueError):
+                continue
+            row = bubble.parentWidget()
+            self._bubbles.remove(bubble)
+            if row is not None:
+                row.setParent(None)
+                row.deleteLater()
+        self.history_changed.emit()
+
+    def _on_send_error(self, message):
+        self._hide_thinking()
+        self._add_system_message(
+            f"**Something went wrong**\n\n{message}", tone="error")
+        self._set_status("", busy=False)
+
+    # ── conversations ─────────────────────────────────────────────────────────
+    def start_new_chat(self):
+        """Clear the transcript and start an unsaved conversation."""
+        self.current_chat_id = None
+        self._clear_transcript()
+        self._show_empty_state()
+        self._set_status("", busy=False)
+        self.composer.clear_attachments()
+        self.composer.focus_input()
+        self.session_changed.emit("")
+
+    def open_chat(self, chat_id, title=""):
+        """Load an existing conversation into the transcript."""
+        self.current_chat_id = str(chat_id)
+        self._clear_transcript()
+        self._set_status(f"Loading {title or 'chat'}…")
+
+        thread = FetchMessagesThread(self.client, chat_id)
+        thread.finished.connect(self._on_messages_loaded)
+        thread.error.connect(self._on_messages_error)
+        self._threads.append(thread)
+        thread.start()
+        self.session_changed.emit(self.current_chat_id)
+
+    def _on_messages_loaded(self, messages):
+        self._clear_transcript()
+        if not messages:
+            self._show_empty_state()
+        for message in messages:
+            role = message.get("role", "user")
+            is_user_flag = message.get("is_user", None)
+            if is_user_flag is not None:
+                is_user = bool(is_user_flag)
+            else:
+                is_user = role != "assistant"
+            self.add_message(
+                message.get("content", ""), is_user=is_user,
+                timestamp=self._format_timestamp(
+                    message.get("system_registration_date", "")),
+                thinking=thinking_text(message.get("thinking_content")),
+                tool_calls=message.get("tool_calls_content"),
+                message_id=message.get("id"),
+            )
+        self._set_status("", busy=False)
+
+    @staticmethod
+    def _format_timestamp(raw):
+        """"2026-06-27T21:33:58.818Z" -> "Jun 27 21:33", or None."""
+        if not raw:
+            return None
+        try:
+            parsed = QDateTime.fromString(raw[:19], "yyyy-MM-ddTHH:mm:ss")
+            return parsed.toString("MMM d HH:mm") if parsed.isValid() else None
+        except Exception:
+            return None
+
+    def _on_messages_error(self, message):
+        self._add_system_message(
+            f"**Could not load this chat**\n\n{message}", tone="error")
+        self._set_status("", busy=False)
+
+    # ── geometry input ────────────────────────────────────────────────────────
+    def start_draw(self):
+        """Let the user draw an area on the QGIS canvas."""
+        if not self.iface:
+            self._add_system_message(
+                "Drawing needs the QGIS map canvas, which is not available "
+                "here.")
+            return
+        self._set_status("Draw on the map — right-click to finish")
+        # minimize_parent=False: the whole point of docking is that the canvas
+        # is already visible beside the panel, so hiding the panel to reach the
+        # map (what the modal dialog had to do) is now counterproductive.
+        self.geo_manager.start_draw_mode(
+            minimize_parent=False, show_help=True, help_context="gopilot")
+
+    def pick_layer(self):
+        """Attach a loaded QGIS vector layer, converted to GeoJSON."""
+        if not self.iface:
+            self._add_system_message(
+                "Selecting a layer needs a QGIS project, which is not "
+                "available here.")
+            return
+        self.geo_manager.show_layer_picker(
+            title="Select a layer",
+            message="Pick a vector layer to send with your message:")
+
+    def _on_geometry_ready(self, geometry_data):
+        name = geometry_data.get("name") or "Area"
+        source = geometry_data.get("source")
+        self.composer.set_geometry(geometry_data.get("geojson"), name)
+        self._set_status("", busy=False)
+        self.composer.set_placeholder(
+            f"Ask about {name}…" if source == "layer"
+            else "Ask about the area you drew…")
+        self.composer.focus_input()
+
+    # ── streaming hooks ───────────────────────────────────────────────────────
+    # Wired and ready: the transport currently replaces the thinking bubble in
+    # one step, but a chunked one only needs to call these three.
     def begin_ai_stream(self):
         self._hide_thinking()
-        bubble = MessageBubble("", role="ai", client=self.client)
+        bubble = MessageBubble("", role="ai", client=self.client,
+                               iface=self.iface)
         self._add_bubble(bubble, "left")
         self._streaming_bubble = bubble
         return bubble
@@ -1181,400 +976,19 @@ class GoPilotPage(QWidget):
         if self._streaming_bubble is not None and full_text is not None:
             self._streaming_bubble.set_content(full_text)
         self._streaming_bubble = None
-        self._enable_input(True)
-        self.status_label.setText("Ready")
+        self._set_status("", busy=False)
         self._scroll_to_bottom()
 
-    # ── scrolling / input state ───────────────────────────────────────────────
-    def _scroll_to_bottom(self):
-        bar = self.chat_scroll.verticalScrollBar()
-        bar.setValue(bar.maximum())
-
-    def _enable_input(self, enabled):
-        self.message_input.setEnabled(enabled)
-        self.btn_send.setEnabled(enabled)
-        if enabled:
-            self.message_input.setFocus()
-
-    # ── send flow ─────────────────────────────────────────────────────────────
-    def send_message(self):
-        message = self.message_input.text().strip()
-        if not message:
-            return
-        self._remove_greeting()
-
-        # Check if file is attached
-        has_file = self._attached_geojson is not None
-
-        # Add user message with file indicator
-        self.add_message(message, is_user=True, has_attachment=has_file)
-        self.message_input.clear()
-        self._show_thinking()
-        self._enable_input(False)
-        self.status_label.setText("Sending message...")
-
-        # Prepare input_metadata and geojson_data if geometry is attached
-        input_metadata = None
-        geojson_data = None
-
-        if self._attached_geojson:
-            input_metadata = {
-                "type": "vector_upload",
-                "format": "geojson"
-            }
-            geojson_data = self._attached_geojson
-
-        thread = SendMessageThread(
-            self.client,
-            message,
-            self.current_chat_id,
-            input_metadata=input_metadata,
-            geojson_data=geojson_data
-        )
-        thread.finished.connect(self._on_message_received)
-        thread.error.connect(self._on_message_error)
-        thread.progress.connect(self._on_message_progress)
-        self._threads.append(thread)
-        thread.start()
-
-        # Clear attached geometry after sending
-        self._clear_attached_geometry()
-
-    def _on_message_progress(self, status_text):
-        self.status_label.setText(status_text)
-
-    def _on_message_received(self, response_data):
-        if not self.current_chat_id and response_data.get("session_id"):
-            self.current_chat_id = response_data["session_id"]
-            self.load_chat_history()
-        self._hide_thinking()
-        msg = response_data.get("message", "")
-        if msg:
-            self.add_message(msg, is_user=False)
-        self._enable_input(True)
-        self.status_label.setText("Ready")
-
-    def _on_message_error(self, error_msg):
-        self._hide_thinking()
-        self._add_system_message(f"\u26A0\uFE0F Error: {error_msg}")
-        self._enable_input(True)
-        self.status_label.setText("Error occurred")
-
-    # ── chat history (left list) ──────────────────────────────────────────────
-    def load_chat_history(self):
-        self.chat_list.clear()
-        thread = FetchChatsThread(self.client)
-        thread.finished.connect(self._on_chats_loaded)
-        thread.error.connect(self._on_chats_error)
-        self._threads.append(thread)
-        thread.start()
-
-    def _on_chats_loaded(self, chats):
-        for chat in chats:
-            item_widget = QWidget()
-            il = QHBoxLayout(item_widget)
-            il.setContentsMargins(8, 6, 8, 6)
-            il.setSpacing(8)
-
-            info = QVBoxLayout()
-            info.setSpacing(2)
-            tl = QLabel(chat["title"])
-            tl.setObjectName("chat_title")
-            tl.setStyleSheet(
-                "font-weight:bold; font-size:12px; border:none; background:transparent;")
-            info.addWidget(tl)
-            tm = QLabel(chat["timestamp"])
-            tm.setObjectName("chat_time")
-            tm.setStyleSheet(
-                "font-size:10px; color:#888; border:none; background:transparent;")
-            info.addWidget(tm)
-            il.addLayout(info, stretch=1)
-
-            del_btn = QPushButton()
-            del_btn.setIcon(create_trash_icon(16, theme_utils.BRAND_DANGER))
-            del_btn.setFixedSize(24, 24)
-            del_btn.setCursor(Qt_PointingHandCursor)
-            del_btn.setToolTip("Delete chat")
-            # Prevent Enter key from triggering delete
-            del_btn.setAutoDefault(False)
-            del_btn.setDefault(False)
-            del_btn.setStyleSheet(
-                f"QPushButton {{ background:{theme_utils.get_card_bg()}; "
-                f"border:1px solid {theme_utils.get_card_border()}; "
-                f"border-radius:4px; padding:4px; }}"
-                f"QPushButton:hover {{ background:{theme_utils.get_danger_hover_bg()}; "
-                f"border-color:{theme_utils.BRAND_DANGER}; }}"
-            )
-            del_btn.clicked.connect(lambda _, c=chat: self._on_delete_chat(c))
-            il.addWidget(del_btn, alignment=Qt_AlignTop)
-
-            item = QListWidgetItem(self.chat_list)
-            item.setData(Qt_UserRole, chat["id"])
-            item.setSizeHint(item_widget.sizeHint())
-            self.chat_list.addItem(item)
-            self.chat_list.setItemWidget(item, item_widget)
-            item_widget.mousePressEvent = lambda e, itm=item: self._on_chat_item_clicked(
-                itm)
-
-        self.chat_list.itemSelectionChanged.connect(
-            self._update_chat_list_colors)
-
-    def _on_chats_error(self, error_msg):
-        debug_print(f"[GoPilot] Failed to load chat history: {error_msg}")
-
-    def _on_chat_item_clicked(self, item):
-        self.chat_list.setCurrentItem(item)
-        self.load_chat(item)
-
-    def _update_chat_list_colors(self):
-        text_color = theme_utils.get_text_color()
-        for i in range(self.chat_list.count()):
-            item = self.chat_list.item(i)
-            widget = self.chat_list.itemWidget(item)
-            if not widget:
-                continue
-            tl = widget.findChild(QLabel, "chat_title")
-            tm = widget.findChild(QLabel, "chat_time")
-            if item.isSelected():
-                if tl:
-                    tl.setStyleSheet(
-                        "font-weight:bold; font-size:12px; border:none; background:transparent; color:white;")
-                if tm:
-                    tm.setStyleSheet(
-                        "font-size:10px; border:none; background:transparent; color:rgba(255,255,255,0.8);")
-            else:
-                if tl:
-                    tl.setStyleSheet(
-                        f"font-weight:bold; font-size:12px; border:none; background:transparent; color:{text_color};")
-                if tm:
-                    tm.setStyleSheet(
-                        "font-size:10px; color:#888; border:none; background:transparent;")
-
-    def _on_delete_chat(self, chat):
-        chat_title = chat.get("title", "this chat")
-        chat_id = chat.get("id")
-        box = QMessageBox(self)
-        box.setWindowTitle("Delete Chat")
-        box.setIcon(QMessageBox_Question)
-        box.setText(f'Are you sure you want to delete "{chat_title}"?')
-        box.setInformativeText("This action cannot be undone.")
-        box.setStandardButtons(QMessageBox_Yes | QMessageBox_No)
-        box.setDefaultButton(QMessageBox_No)
-        if exec_dialog(box) != QMessageBox_Yes:
-            return
-        thread = DeleteChatThread(self.client, chat_id)
-        thread.finished.connect(lambda: self._on_chat_deleted(chat_id))
-        thread.error.connect(
-            lambda msg: QMessageBox.warning(
-                self, "Error", f"Failed to delete chat:\n{msg}")
-        )
-        self._threads.append(thread)
-        thread.start()
-
-    def _on_chat_deleted(self, deleted_chat_id):
-        if self.current_chat_id == deleted_chat_id:
-            self.start_new_chat()
-        self.load_chat_history()
-
-    # ── load a conversation ───────────────────────────────────────────────────
-    def load_chat(self, item):
-        chat_id = item.data(Qt_UserRole)
-        self.current_chat_id = chat_id
-        self._clear_messages()
-        self.messages_layout.addStretch()
-        self._add_system_message(
-            f"\U0001F4C2 Loading chat: {item.text().split(chr(10))[0]}..."
-        )
-        self.status_label.setText(f"Loading chat {chat_id}...")
-        thread = FetchMessagesThread(self.client, chat_id)
-        thread.finished.connect(self._on_messages_loaded)
-        thread.error.connect(self._on_messages_error)
-        self._threads.append(thread)
-        thread.start()
-
-    def _on_messages_loaded(self, messages):
-        self._clear_messages()
-        self.messages_layout.addStretch()
-
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            is_user_flag = msg.get("is_user", None)
-
-            # DEBUG: Print LLM message content to Python console
-            if role == "assistant" or (is_user_flag is not None and not is_user_flag):
-                debug_print("="*80)
-                debug_print("[GoPilot] LLM Message Content:")
-                debug_print("="*80)
-                debug_print(content)
-                debug_print("="*80)
-
-            # Extract and format timestamp from system_registration_date
-            # Format: "2026-06-27T21:33:58.818829Z" -> "Jun 27 21:33"
-            timestamp = None
-            system_date = msg.get("system_registration_date", "")
-            if system_date:
-                try:
-                    # Parse ISO timestamp with QDateTime
-                    dt = QDateTime.fromString(
-                        system_date[:19], "yyyy-MM-ddTHH:mm:ss")
-                    if dt.isValid():
-                        # Format as "MMM d HH:mm" (e.g., "Jun 18 18:40")
-                        timestamp = dt.toString("MMM d HH:mm")
-                except Exception:
-                    timestamp = None
-
-            if is_user_flag is not None:
-                self.add_message(content, is_user=is_user_flag,
-                                 timestamp=timestamp)
-            elif role == "assistant":
-                self.add_message(content, is_user=False, timestamp=timestamp)
-            else:
-                self.add_message(content, is_user=True, timestamp=timestamp)
-        self.status_label.setText(
-            f"This chat contains {len(messages)} messages"
-        )
-
-    def _on_messages_error(self, error_msg):
-        self._add_system_message(
-            f"\u26A0\uFE0F Failed to load messages: {error_msg}")
-        self.status_label.setText("Error loading chat")
-
-    def start_new_chat(self):
-        self.current_chat_id = None
-        self.chat_list.clearSelection()
-        self._show_greeting()
-        self.status_label.setText("New Chat")
-        self.message_input.setFocus()
-    # ── geometry input (draw & layer picker) ──────────────────────────────────
-
-    def _start_draw_geometry(self):
-        """Start drawing geometry on the map"""
-        if not self.iface:
-            return
-
-        # Update button style to indicate active state
-        self.btn_draw.setStyleSheet(f"""
-            QPushButton {{
-                background:{theme_utils.BRAND_PRIMARY};
-                border:2px solid {theme_utils.BRAND_PRIMARY};
-                border-radius:8px; font-size:18px; color:white;
-            }}
-        """)
-        self.status_label.setText("Draw on map (right-click to finish)")
-
-        # Start draw mode using geometry manager with help dialog
-        self.geo_manager.start_draw_mode(
-            minimize_parent=True,
-            show_help=True,
-            help_context="gopilot"
-        )
-
-    def _pick_layer(self):
-        """Show layer picker dialog"""
-        if not self.iface:
-            return
-
-        # Show layer picker using geometry manager
-        self.geo_manager.show_layer_picker(
-            title="Select Layer",
-            message="Select a vector layer to attach to your message:"
-        )
-
-    def _on_geometry_ready(self, geometry_data):
-        """Handle geometry input completion from drawing or layer selection.
-
-        Args:
-            geometry_data: Dict with 'geojson', 'source', and 'name' keys
-        """
-        # Store the GeoJSON data
-        self._attached_geojson = geometry_data['geojson']
-
-        # Update UI based on source
-        source = geometry_data['source']
-        name = geometry_data['name']
-
-        if source == 'draw':
-            # Reset draw button style
-            self.btn_draw.setStyleSheet(f"""
-                QPushButton {{
-                    background:{theme_utils.get_card_bg()};
-                    border:2px solid {theme_utils.BRAND_PRIMARY};
-                    border-radius:8px; font-size:18px;
-                }}
-            """)
-            self.status_label.setText("Geometry attached ✓")
-            self.message_input.setPlaceholderText(
-                "Geometry attached - Type your message...")
-        elif source == 'layer':
-            # Highlight layer button
-            self.btn_layer.setStyleSheet(f"""
-                QPushButton {{
-                    background:{theme_utils.get_card_bg()};
-                    border:2px solid {theme_utils.BRAND_PRIMARY};
-                    border-radius:8px; font-size:18px;
-                }}
-            """)
-            self.status_label.setText(f"Layer '{name}' attached ✓")
-            self.message_input.setPlaceholderText(
-                f"Layer '{name}' attached - Type your message...")
-
-    def _clear_attached_geometry(self):
-        """Clear attached geometry and reset UI"""
-        self._attached_geojson = None
-        self.message_input.setPlaceholderText("Type your message here...")
-        self.status_label.setText("Ready")
-
-        # Reset button styles if iface is available
-        if self.iface:
-            self.btn_draw.setStyleSheet(f"""
-                QPushButton {{
-                    background:{theme_utils.get_card_bg()};
-                    border:2px solid {theme_utils.get_card_border()};
-                    border-radius:8px; font-size:18px;
-                }}
-                QPushButton:hover {{
-                    background:{theme_utils.get_hover_bg()};
-                    border-color:{theme_utils.BRAND_PRIMARY};
-                }}
-            """)
-            self.btn_layer.setStyleSheet(f"""
-                QPushButton {{
-                    background:{theme_utils.get_card_bg()};
-                    border:2px solid {theme_utils.get_card_border()};
-                    border-radius:8px; font-size:18px;
-                }}
-                QPushButton:hover {{
-                    background:{theme_utils.get_hover_bg()};
-                    border-color:{theme_utils.BRAND_PRIMARY};
-                }}
-            """)
-
+    # ── lifecycle ─────────────────────────────────────────────────────────────
     def closeEvent(self, event):
-        """Handle widget close event - clean up resources"""
         self.cleanup()
         super().closeEvent(event)
 
     def cleanup(self):
-        """Clean up resources to prevent crashes"""
-        # Stop all running threads
-        for thread in self._threads:
-            if thread and thread.isRunning():
-                try:
-                    thread.quit()
-                    thread.wait(1000)  # Wait max 1 second
-                except Exception as exc:
-                    # Thread may already be gone during shutdown; log and continue.
-                    debug_print(
-                        f"[GoPilot] Error stopping thread during cleanup: {exc}")
-
-        # Clean up geometry manager
-        if hasattr(self, "geo_manager") and self.geo_manager:
+        """Stop threads and release the map tool. Safe to call twice."""
+        stop_threads(self._threads)
+        if getattr(self, "geo_manager", None) is not None:
             try:
                 self.geo_manager.cleanup()
             except Exception as exc:
-                debug_print(
-                    f"[GoPilot] Error cleaning up geometry manager: {exc}")
-
-        # Clear thread list
-        self._threads.clear()
+                debug_print(f"[GoPilot] Geometry manager cleanup: {exc}")

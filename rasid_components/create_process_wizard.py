@@ -1,11 +1,35 @@
-"""Dynamic process creation wizard — embedded as a QWidget page."""
+"""Dynamic process creation wizard — embedded as a QWidget page.
+
+ONE FORM, BUILT FROM THE SOLUTION'S CONFIG
+==========================================
+Every section below is created up front and then shown or hidden by
+:meth:`_update_sections` according to the dataset type the user picks, because
+the API describes what a solution supports rather than handing over a form.
+
+STYLING IS SET ONCE, ON THE FORM
+================================
+The controls are plain Qt widgets — combo boxes, date edits, a spin box, radio
+buttons — and ``design.form_qss()`` on the form container styles all of them
+together. Done per widget, a dozen inputs means a dozen chances to miss one,
+and the ones that were missed showed QGIS's native styling in the middle of
+the panel. The selectors are type-scoped, so they reach the form's inputs
+without leaking onto anything else.
+
+NO TITLE BAR OF ITS OWN
+=======================
+The processes page's header already names the project and carries Back while
+this page is up, so a second title bar here put the project name on screen
+twice and cost 37px of a ~420px-wide panel. The actions sit in a pinned bar at
+the foot of the form instead, where a long form needs them reachable without
+scrolling back.
+"""
 import json
 
 from qgis.PyQt.QtWidgets import (
-    QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
+    QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QComboBox, QDateEdit, QFileDialog, QWidget, QMessageBox, QRadioButton,
-    QButtonGroup, QGroupBox, QTextEdit, QListWidget, QListWidgetItem,
-    QScrollArea, QFrame, QSpinBox,
+    QButtonGroup, QTextEdit, QListWidget, QListWidgetItem,
+    QFrame, QSpinBox,
 )
 from qgis.PyQt.QtCore import QThread, pyqtSignal, QDate
 from qgis.core import (
@@ -14,10 +38,15 @@ from qgis.core import (
 )
 from .geometry import GeometryInputManager
 from .compat import (
-    Qt_AlignCenter, Qt_PointingHandCursor, Qt_UserRole, QFrame_NoFrame,
-    QMessageBox_Yes, QMessageBox_No
+    Qt_AlignCenter, Qt_UserRole,
+    QMessageBox_Yes, QMessageBox_No,
+    QSizePolicy_Expanding, QSizePolicy_Fixed,
 )
-from . import theme_utils
+from . import design
+from .widgets import (
+    SectionCard, paint_background, primary_button, secondary_button,
+    styled_scroll_area,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -83,14 +112,6 @@ class CreateProcessThread(QThread):
 #  Wizard widget (embedded, not a popup)
 # ---------------------------------------------------------------------------
 
-BTN_STYLE = (
-    "QPushButton {{ background: {bg}; color: white; border: none;"
-    "border-radius: 4px; padding: 8px 16px; font-weight: bold; }}"
-    "QPushButton:hover {{ background: {hover}; }}"
-    "QPushButton:disabled {{ background: #bdc3c7; }}"
-)
-
-
 class CreateProcessWizard(QWidget):
     """Dynamic form that adapts to the solution's process-config."""
 
@@ -113,66 +134,66 @@ class CreateProcessWizard(QWidget):
         self.geo_manager = GeometryInputManager(iface, parent_widget=self)
         self.geo_manager.geometry_ready.connect(self._on_geometry_ready)
 
-        # Main layout
+        t = design.tokens()
+        paint_background(self, t.canvas, "createProcessWizard")
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Title bar
-        title_bar = QFrame()
-        header_bg = theme_utils.get_sidebar_bg()
-        header_border = theme_utils.get_separator_color()
-        title_bar.setStyleSheet(f"background: {header_bg}; border-bottom: 1px solid {header_border};")
-        title_layout = QHBoxLayout(title_bar)
-        title_layout.setContentsMargins(12, 8, 12, 8)
-
-        title_lbl = QLabel(f"New Process — {project_title}")
-        text_color = theme_utils.get_text_color()
-        title_lbl.setStyleSheet(f"font-weight: bold; font-size: 15px; color: {text_color};")
-        title_layout.addWidget(title_lbl)
-        title_layout.addStretch()
-        outer.addWidget(title_bar)
-
-        # Scrollable form
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame_NoFrame)
+        # No title bar here — see the module docstring. The page header above
+        # already reads "<project>" with Back beside it.
+        scroll = styled_scroll_area()
         outer.addWidget(scroll, stretch=1)
 
         self._form = QWidget()
+        # Every input in the form, styled in one place.
+        self._form.setStyleSheet(design.form_qss())
         self._form_layout = QVBoxLayout(self._form)
-        self._form_layout.setSpacing(12)
-        self._form_layout.setContentsMargins(16, 16, 16, 16)
+        self._form_layout.setSpacing(design.SPACE_3)
+        self._form_layout.setContentsMargins(
+            design.SPACE_3, design.SPACE_3, design.SPACE_3, design.SPACE_3)
         scroll.setWidget(self._form)
 
-        # Loading state
-        self._loading_label = QLabel("Loading process configuration...")
+        self._loading_label = QLabel("Loading process configuration…")
         self._loading_label.setAlignment(Qt_AlignCenter)
+        self._loading_label.setStyleSheet(
+            design.body_qss(design.TEXT_BASE, secondary=True))
         self._form_layout.addWidget(self._loading_label)
 
-        # Bottom button bar
+        # ── Action bar, pinned below the scroll area ──
+        # Surface-alt with a top rule, the same treatment the composer's band
+        # gets, so the form reads as scrolling content under a fixed footer.
         btn_bar = QFrame()
-        btn_bar.setStyleSheet(f"background: {header_bg}; border-top: 1px solid {header_border};")
+        btn_bar.setObjectName("wizardActions")
+        btn_bar.setStyleSheet(
+            f"QFrame#wizardActions {{ background:{t.surface_alt}; "
+            f"border:none; border-top:{design.BORDER}px solid {t.border}; }}"
+        )
         btn_layout = QHBoxLayout(btn_bar)
-        btn_layout.setContentsMargins(12, 8, 12, 8)
+        btn_layout.setContentsMargins(design.SPACE_3, design.SPACE_2,
+                                      design.SPACE_3, design.SPACE_2)
+        btn_layout.setSpacing(design.SPACE_2)
 
-        self._submit_btn = QPushButton("Create Process")
-        self._submit_btn.setStyleSheet(BTN_STYLE.format(bg=theme_utils.BRAND_PRIMARY, hover=theme_utils.BRAND_HOVER))
-        self._submit_btn.setCursor(Qt_PointingHandCursor)
+        # No icon. A tick means "done" or "confirmed", and this button is
+        # neither — pressing it STARTS the work. It also made this the only
+        # create action in the panel carrying a glyph: Create project in GoBox
+        # and New process in the header are both label-only.
+        self._submit_btn = primary_button("Create process")
         self._submit_btn.setEnabled(False)
         self._submit_btn.clicked.connect(self._on_submit)
         btn_layout.addWidget(self._submit_btn)
 
-        self._cancel_btn = QPushButton("Cancel")
-        self._cancel_btn.setCursor(Qt_PointingHandCursor)
-        self._cancel_btn.setStyleSheet(BTN_STYLE.format(bg=theme_utils.BRAND_DANGER, hover="#c0392b"))
+        # Secondary, not danger. Cancelling a form the user has not submitted
+        # destroys nothing, and a red button beside the primary action reads as
+        # the dangerous half of a destructive choice.
+        self._cancel_btn = secondary_button("Cancel")
         self._cancel_btn.clicked.connect(self.cancelled.emit)
         btn_layout.addWidget(self._cancel_btn)
 
         btn_layout.addStretch()
         outer.addWidget(btn_bar)
 
-        # Fetch config
         self._fetch_config()
 
     # ------------------------------------------------------------------
@@ -200,25 +221,27 @@ class CreateProcessWizard(QWidget):
     # ------------------------------------------------------------------
 
     def _build_form(self, config):
+        t = design.tokens()
         supports = config.get("supports", {})
-        fields = config.get("fields", {})
         sentinel_cfg = config.get("sentinel", {})
 
         # Process name
-        grp = self._make_group("Process Name")
+        grp = self._make_group("Process name", icon_name="message")
         self._name_input = QLineEdit()
         self._name_input.setPlaceholderText("Enter a name for this process")
         grp.layout().addWidget(self._name_input)
 
         # Dataset type selection
         supported_types = []
+        # Sentence case, like every other label in the panel. Proper nouns
+        # keep their capitals.
         type_labels = {
-            "mapbox": "Mapbox Tiles",
-            "sentinel_catalogue": "Sentinel Catalogue",
-            "sentinel_series": "Sentinel Time Series",
-            "planet": "Planet Imagery",
-            "raster_upload": "Upload Raster",
-            "raster_link": "Raster Link",
+            "mapbox": "Mapbox tiles",
+            "sentinel_catalogue": "Sentinel catalogue",
+            "sentinel_series": "Sentinel time series",
+            "planet": "Planet imagery",
+            "raster_upload": "Upload raster",
+            "raster_link": "Raster link",
         }
         for key, label in type_labels.items():
             if supports.get(key):
@@ -230,7 +253,7 @@ class CreateProcessWizard(QWidget):
         if len(supported_types) == 1:
             self._dataset_type = supported_types[0][0]
         elif len(supported_types) > 1:
-            grp = self._make_group("Dataset Type")
+            grp = self._make_group("Dataset type", icon_name="layers")
             self._type_btn_group = QButtonGroup(self)
             for i, (key, label) in enumerate(supported_types):
                 rb = QRadioButton(label)
@@ -240,13 +263,12 @@ class CreateProcessWizard(QWidget):
             # NOTE: connect signals and set default AFTER all sections are built (see below)
 
         # --- AOI section ---
-        self._aoi_group = self._make_group("Area of Interest (AOI)")
+        self._aoi_group = self._make_group(
+            "Area of interest", icon_name="map-pin")
         aoi_layout = self._aoi_group.layout()
 
         aoi_btn_row = QHBoxLayout()
-        self._draw_btn = QPushButton("Draw on Map")
-        self._draw_btn.setCursor(Qt_PointingHandCursor)
-        self._draw_btn.setStyleSheet(BTN_STYLE.format(bg="#1E293B", hover="#334155"))
+        self._draw_btn = secondary_button("Draw on map", icon_name="draw")
         self._draw_btn.clicked.connect(self._start_draw_aoi)
         aoi_btn_row.addWidget(self._draw_btn)
 
@@ -268,10 +290,31 @@ class CreateProcessWizard(QWidget):
         aoi_btn_row.addWidget(self._layer_combo)
         aoi_layout.addLayout(aoi_btn_row)
 
+        # Read-only, so it is styled as a sunken well rather than as a field
+        # someone could type into: same radius and border as an input, but the
+        # canvas fill and the muted monospace-ish body size of a readout.
         self._aoi_display = QTextEdit()
         self._aoi_display.setReadOnly(True)
-        self._aoi_display.setMaximumHeight(60)
-        self._aoi_display.setPlaceholderText("No AOI set. Draw on map or pick from layer.")
+        # Fixed height AND a Fixed vertical POLICY. The height alone is not
+        # enough: setFixedHeight sets the min and max but leaves the policy
+        # alone, and a QTextEdit's is Expanding. A layout item reports its
+        # widget's policy, not its limits, so the card went on advertising
+        # itself as vertically expanding (expandingDirections 3 against 1 for
+        # its siblings) and the form handed it the spare height instead of the
+        # trailing stretch — 342px against a 160px hint, which is where the
+        # bands of empty space above and below its title came from.
+        self._aoi_display.setFixedHeight(62)
+        self._aoi_display.setSizePolicy(QSizePolicy_Expanding,
+                                        QSizePolicy_Fixed)
+        self._aoi_display.setPlaceholderText(
+            "No area set. Draw on the map or pick a layer.")
+        self._aoi_display.setStyleSheet(
+            f"QTextEdit {{ background:{t.surface_sunken}; color:{t.text}; "
+            f"border:{design.BORDER}px solid {t.border}; "
+            f"border-radius:{design.RADIUS}px; padding:6px 8px; "
+            f"font-family:{design.FONT_STACK}; "
+            f"font-size:{design.TEXT_SM}px; }}"
+        )
         aoi_layout.addWidget(self._aoi_display)
 
         # --- Date range ---
@@ -282,17 +325,17 @@ class CreateProcessWizard(QWidget):
         start_label = start_date_cfg.get("label", "Start Date")
         self._end_date_hidden = end_date_cfg.get("hidden", False)
 
-        self._date_group = self._make_group("Date Range")
+        self._date_group = self._make_group("Date range", icon_name="history")
         date_layout = self._date_group.layout()
         date_row = QHBoxLayout()
-        date_row.addWidget(QLabel(f"{start_label}:"))
+        date_row.addWidget(self._field_label(start_label))
         self._start_date = QDateEdit()
         self._start_date.setCalendarPopup(True)
         self._start_date.setDate(QDate.currentDate().addMonths(-1))
         date_row.addWidget(self._start_date)
 
         end_label = end_date_cfg.get("label", "End Date")
-        self._end_date_label = QLabel(f"{end_label}:")
+        self._end_date_label = self._field_label(end_label)
         date_row.addWidget(self._end_date_label)
         self._end_date = QDateEdit()
         self._end_date.setCalendarPopup(True)
@@ -301,27 +344,28 @@ class CreateProcessWizard(QWidget):
         date_layout.addLayout(date_row)
 
         # --- Sentinel settings (populated from config) ---
-        self._sentinel_group = self._make_group("Sentinel Settings")
+        self._sentinel_group = self._make_group(
+            "Sentinel settings", icon_name="settings")
         s_layout = self._sentinel_group.layout()
         sentinel_choices = sentinel_cfg.get("choices", {})
         sentinel_defaults = sentinel_cfg.get("defaults", {})
 
         # Data Collection
-        s_layout.addWidget(QLabel("Data Collection:"))
+        s_layout.addWidget(self._field_label("Data collection"))
         self._sentinel_collection = QComboBox()
         for ch in sentinel_choices.get("data_collection", []):
             self._sentinel_collection.addItem(ch.get("label", ch.get("value")), ch.get("value"))
         s_layout.addWidget(self._sentinel_collection)
 
         # Eval Script
-        s_layout.addWidget(QLabel("Eval Script:"))
+        s_layout.addWidget(self._field_label("Eval script"))
         self._sentinel_eval_script = QComboBox()
         for ch in sentinel_choices.get("eval_script", []):
             self._sentinel_eval_script.addItem(ch.get("label", "").strip(), ch.get("value"))
         s_layout.addWidget(self._sentinel_eval_script)
 
         # Sort By
-        s_layout.addWidget(QLabel("Sort By:"))
+        s_layout.addWidget(self._field_label("Sort by"))
         self._sentinel_sort = QComboBox()
         for ch in sentinel_choices.get("sort_by", []):
             self._sentinel_sort.addItem(ch.get("label", ch.get("value")), ch.get("value"))
@@ -334,22 +378,30 @@ class CreateProcessWizard(QWidget):
             self._end_date.setDate(QDate.fromString(sentinel_defaults["end_date"], "yyyy-MM-dd"))
 
         # --- Catalogue search ---
-        self._catalogue_group = self._make_group("Catalogue Search")
+        self._catalogue_group = self._make_group(
+            "Catalogue search", icon_name="search")
         cat_layout = self._catalogue_group.layout()
 
-        self._search_btn = QPushButton("Search Available Imagery")
-        self._search_btn.setCursor(Qt_PointingHandCursor)
-        self._search_btn.setStyleSheet(BTN_STYLE.format(bg="#1E293B", hover="#334155"))
+        self._search_btn = secondary_button(
+            "Search available imagery", icon_name="search")
         self._search_btn.clicked.connect(self._on_search_catalogue)
         cat_layout.addWidget(self._search_btn)
 
         self._catalogue_list = QListWidget()
-        self._catalogue_list.setMaximumHeight(150)
+        # Fixed height and policy, for the same reason as the AOI well.
+        self._catalogue_list.setFixedHeight(150)
+        self._catalogue_list.setSizePolicy(QSizePolicy_Expanding,
+                                           QSizePolicy_Fixed)
+        self._catalogue_list.setStyleSheet(
+            design.list_qss()
+            + f"QListWidget {{ background:{t.surface_sunken}; "
+              f"border:{design.BORDER}px solid {t.border}; }}"
+        )
         cat_layout.addWidget(self._catalogue_list)
 
         # --- Zoom level (for mapbox) ---
         defaults = config.get("defaults", {})
-        self._zoom_group = self._make_group("Zoom Level")
+        self._zoom_group = self._make_group("Zoom level", icon_name="sliders")
         z_layout = self._zoom_group.layout()
         self._zoom_spin = QSpinBox()
         self._zoom_spin.setRange(0, 20)
@@ -357,18 +409,21 @@ class CreateProcessWizard(QWidget):
         z_layout.addWidget(self._zoom_spin)
 
         # --- Raster upload ---
-        self._upload_group = self._make_group("Upload Raster (TIFF)")
+        self._upload_group = self._make_group(
+            "Upload raster (TIFF)", icon_name="upload")
         u_layout = self._upload_group.layout()
         upload_row = QHBoxLayout()
         self._upload_label = QLabel("No file selected")
+        self._upload_label.setStyleSheet(
+            design.body_qss(design.TEXT_BASE, secondary=True))
         upload_row.addWidget(self._upload_label, stretch=1)
-        upload_btn = QPushButton("Choose File")
+        upload_btn = secondary_button("Choose file", icon_name="upload")
         upload_btn.clicked.connect(self._on_choose_file)
         upload_row.addWidget(upload_btn)
         u_layout.addLayout(upload_row)
 
         # --- Raster link ---
-        self._link_group = self._make_group("Raster Link")
+        self._link_group = self._make_group("Raster link", icon_name="attach")
         l_layout = self._link_group.layout()
         self._link_input = QLineEdit()
         self._link_input.setPlaceholderText("https://example.com/raster.tif")
@@ -384,19 +439,35 @@ class CreateProcessWizard(QWidget):
             self._type_radios[first_key].setChecked(True)
         self._update_sections()
 
-    def _make_group(self, title):
-        grp = QGroupBox(title)
-        text_color = theme_utils.get_text_color()
-        border_color = theme_utils.get_card_border()
-        grp.setStyleSheet(
-            f"QGroupBox {{ font-weight: bold; border: 1px solid {border_color};"
-            f"border-radius: 4px; margin-top: 8px; padding-top: 16px; color: {text_color}; }}"
-            f"QGroupBox::title {{ subcontrol-origin: margin; left: 10px; }}"
-        )
-        layout = QVBoxLayout()
-        grp.setLayout(layout)
-        self._form_layout.addWidget(grp)
-        return grp
+    def _field_label(self, text):
+        """A label above or beside an input.
+
+        Secondary colour and a trailing colon, applied in one place so the
+        sentinel settings, the date range and anything added later agree. The
+        form's own QLabel rule covers labels that do not go through here; this
+        is for the ones that should read as quieter than body copy.
+        """
+        label = QLabel(f"{text}:")
+        label.setStyleSheet(design.body_qss(design.TEXT_BASE, secondary=True))
+        return label
+
+    def _make_group(self, title, icon_name=None):
+        """One titled card per form section.
+
+        A ``SectionCard``, the same component Settings, GoBox and Projects use,
+        rather than the ``QGroupBox`` this used to be. The group box drew a
+        hairline frame with the title notched into it and sat on the page
+        background — a different idiom from every other surface in the panel,
+        and its stylesheet set a bare ``font-weight`` and ``color`` that every
+        label and input inside it then inherited.
+
+        Returns the card. Callers reach its layout through ``layout()``, which
+        ``SectionCard`` inherits from ``QFrame``, so the existing
+        ``grp.layout().addWidget(...)`` calls keep working.
+        """
+        card = SectionCard(title, icon_name=icon_name)
+        self._form_layout.addWidget(card)
+        return card
 
     # ------------------------------------------------------------------
     #  Section visibility
@@ -436,8 +507,11 @@ class CreateProcessWizard(QWidget):
 
     def _start_draw_aoi(self):
         """Start drawing AOI using the geometry manager"""
+        # minimize_parent=False, for the same reason the chat page passes it:
+        # this wizard is a page inside the docked panel, not the standalone
+        # dialog it used to be, so its top-level window is QGIS's.
         self.geo_manager.start_draw_mode(
-            minimize_parent=True,
+            minimize_parent=False,
             show_help=True,
             help_context="wizard"
         )

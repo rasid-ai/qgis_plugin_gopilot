@@ -26,9 +26,11 @@ Usage:
 
 import json
 from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer
-from qgis.PyQt.QtWidgets import QDialog, QVBoxLayout, QListWidget, QPushButton, QHBoxLayout, QLabel, QMessageBox
+from qgis.PyQt.QtWidgets import QDialog, QVBoxLayout, QListWidget, QHBoxLayout, QLabel, QMessageBox
 from qgis.core import QgsProject, QgsVectorLayer, QgsWkbTypes, QgsJsonExporter, QgsCoordinateReferenceSystem, QgsCoordinateTransform
 from ..compat import exec_dialog
+from .. import design
+from ..widgets import primary_button, secondary_button
 from .modern_draw_tool import ModernDrawTool
 from .drawing_help_dialog import DrawingHelpDialog
 
@@ -69,15 +71,33 @@ class GeometryInputManager(QObject):
         self._prev_map_tool = None
         self._parent_dialog = None
 
+    def _host_window(self):
+        """QGIS's own main window — the one thing we must never minimize.
+
+        Returns None outside QGIS (``iface`` is optional), in which case
+        nothing is treated as the host and a genuinely standalone parent
+        window can still step aside.
+        """
+        try:
+            return self.iface.mainWindow() if self.iface else None
+        except (AttributeError, RuntimeError):
+            return None
+
     # ─────────────────────────────────────────────────────────────────────────
     # Drawing Mode
     # ─────────────────────────────────────────────────────────────────────────
 
-    def start_draw_mode(self, minimize_parent=True, show_help=True, help_context="general"):
+    def start_draw_mode(self, minimize_parent=False, show_help=True, help_context="general"):
         """Start drawing mode on the map canvas.
 
         Args:
-            minimize_parent: If True, minimizes the parent window to show map
+            minimize_parent: If True, minimize the parent window so the canvas
+                is visible. Defaults to False, and is ignored when the parent's
+                top-level window is QGIS itself (see the guard below): a docked
+                panel sits BESIDE the canvas, so there is nothing to get out of
+                the way, and minimizing the host application to draw on it is
+                never what the user asked for. Only a window this plugin owns
+                can be stepped aside.
             show_help: If True, shows help dialog before starting (if user hasn't disabled it)
             help_context: Context for help dialog ('gopilot', 'wizard', 'general')
         """
@@ -109,12 +129,21 @@ class GeometryInputManager(QObject):
         self._draw_tool.polygon_finished.connect(self._on_draw_finished)
         self.canvas.setMapTool(self._draw_tool)
 
-        # Minimize parent dialog if requested
-        # Modern tool has floating toolbar, but we still minimize for better visibility
+        # Step the parent window aside only if the plugin OWNS that window.
+        #
+        # `parent_widget.window()` walks up to the top-level widget, and every
+        # part of this plugin now lives inside a QDockWidget — so when the
+        # panel is docked, that walk arrives at the QGIS MAIN WINDOW. Calling
+        # showMinimized() on it minimized the whole application, and the
+        # showNormal()/activateWindow()/raise_() that restored it afterwards
+        # was what appeared to pick QGIS up and move it. Both were written
+        # when the caller was a separate modal dialog, where minimizing the
+        # dialog was the right thing and `window()` could only be the dialog.
         if minimize_parent and self.parent_widget:
-            self._parent_dialog = self.parent_widget.window()
-            if self._parent_dialog:
-                self._parent_dialog.showMinimized()
+            window = self.parent_widget.window()
+            if window is not None and window is not self._host_window():
+                self._parent_dialog = window
+                window.showMinimized()
 
         self.draw_started.emit()
 
@@ -234,23 +263,43 @@ class GeometryInputManager(QObject):
             )
             return False
 
-        # Create picker dialog
+        # Create picker dialog.
+        #
+        # This dialog had NO styling at all — a bare QDialog, QLabel,
+        # QListWidget and two raw QPushButtons — so it came up in the host
+        # application's font and the host's list colours while the panel that
+        # opened it was in Inter. It carried no hardcoded sizes or colours
+        # either, which is exactly why a sweep for bad styling never found
+        # it: there was nothing there to find.
         dialog = QDialog(self.parent_widget)
         dialog.setWindowTitle(title)
-        dialog.setMinimumWidth(400)
-        dialog.setMinimumHeight(300)
+        dialog.setMinimumWidth(420)
+        dialog.setMinimumHeight(320)
+        t = design.tokens()
+        dialog.setObjectName("layerPicker")
+        dialog.setStyleSheet(
+            f"QDialog#layerPicker {{ background: {t.surface}; }}")
 
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(design.SPACE_5, design.SPACE_5,
+                                  design.SPACE_5, design.SPACE_5)
+        layout.setSpacing(design.SPACE_3)
 
         # Message label
         if not message:
             message = "Select a vector layer to use as geometry input:"
         label = QLabel(message)
         label.setWordWrap(True)
+        label.setStyleSheet(design.body_qss(design.TEXT_MD))
         layout.addWidget(label)
 
         # Layer list
         layer_list = QListWidget()
+        layer_list.setStyleSheet(
+            design.list_qss()
+            + f"QListWidget {{ background:{t.surface_sunken}; "
+              f"border:{design.BORDER}px solid {t.border}; }}"
+        )
         for layer in layers:
             geom_type = QgsWkbTypes.geometryDisplayString(layer.geometryType())
             layer_list.addItem(
@@ -258,15 +307,18 @@ class GeometryInputManager(QObject):
             )
         layout.addWidget(layer_list)
 
-        # Buttons
+        # Primary FIRST, Cancel second — see drawing_help_dialog for why this
+        # deliberately differs from the SaaS footer. The two buttons were
+        # already in this order; only their styling changed.
         btn_row = QHBoxLayout()
-        btn_ok = QPushButton("Select")
+        btn_row.setSpacing(design.SPACE_2)
+        btn_row.addStretch()
+        btn_ok = primary_button("Select")
         btn_ok.setDefault(True)
         btn_ok.clicked.connect(dialog.accept)
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.clicked.connect(dialog.reject)
-        btn_row.addStretch()
         btn_row.addWidget(btn_ok)
+        btn_cancel = secondary_button("Cancel")
+        btn_cancel.clicked.connect(dialog.reject)
         btn_row.addWidget(btn_cancel)
         layout.addLayout(btn_row)
 
