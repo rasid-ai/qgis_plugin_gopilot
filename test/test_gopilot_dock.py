@@ -26,7 +26,7 @@ import sys
 import time
 import unittest
 
-from qgis.PyQt.QtCore import QSize
+from qgis.PyQt.QtCore import QPoint, QSize
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QApplication, QDockWidget, QLabel, QMainWindow, QPushButton, QWidget,
@@ -44,6 +44,16 @@ from qgis.PyQt.QtWidgets import (
 # interpreter outright (exit 127, no traceback). Rather than half-fix someone
 # else's harness from here, these tests make the one thing they actually need.
 QGIS_APP = QApplication.instance() or QApplication(sys.argv[:1])
+
+# QSettings needs an organisation to have a file to write to. QgsApplication
+# sets one inside QGIS; a bare QApplication does not, and then every write is
+# silently dropped — `QSettings().fileName()` is empty and `status()` reports
+# an access error. Any test of a preference would pass or fail on the DEFAULT
+# rather than on what the code stored, which is a test that proves nothing.
+# A test-only scope keeps those writes out of the real QGIS settings.
+if not QGIS_APP.organizationName():
+    QGIS_APP.setOrganizationName("RASIDPluginTests")
+    QGIS_APP.setApplicationName("GoPilotTests")
 
 
 def _code_of(path):
@@ -122,7 +132,7 @@ def _hover_event(widget):
     except TypeError:                       # Qt5 is happy with one
         return QEnterEvent(point.toPoint(), point.toPoint(), point.toPoint())
 
-from rasid_components import design                       # noqa: E402
+from rasid_components import design, prefs               # noqa: E402
 from rasid_components.compat import (                     # noqa: E402
     Qt_Horizontal, Qt_Vertical,
 )
@@ -1620,12 +1630,27 @@ class ComposerAlignmentTest(unittest.TestCase):
         self.shell = None
 
     def _up_from_bottom(self, widget):
-        """Widget's top edge, in px up from the shell's bottom edge."""
-        top_left = widget.mapTo(self.shell, widget.rect().topLeft())
-        return self.shell.height() - top_left.y()
+        """Widget's top edge, in px up from the COMPOSER band's bottom edge.
+
+        The datum used to be the shell's own bottom, because the composer was
+        flush against it. The AI disclaimer now sits below the composer — as
+        it does in the SaaS, where `{disclaimer}` follows `<ChatInput/>` — so
+        that datum measured the composer plus a strip of small print and read
+        144px where the contract says 63. The contract itself is unchanged:
+        it is about the composer's own row, so the composer's own bottom edge
+        is what it has to be measured from.
+        """
+        composer = self.shell.chat_page.composer
+        # top + height, NOT rect().bottom(): a QRect's bottom is INCLUSIVE
+        # (height - 1), so using it measured every distance here one pixel
+        # short and turned both contracts into off-by-ones.
+        base = (composer.mapTo(self.shell, composer.rect().topLeft()).y()
+                + composer.height())
+        top = widget.mapTo(self.shell, widget.rect().topLeft()).y()
+        return base - top
 
     def _centre(self, widget):
-        """Widget's vertical centre, in px up from the shell's bottom edge."""
+        """Widget's vertical centre, in px up from the composer's bottom."""
         return self._up_from_bottom(widget) - widget.height() / 2.0
 
     def test_the_composer_band_is_its_documented_height(self):
@@ -2802,6 +2827,2042 @@ class SweptDialogsTest(unittest.TestCase):
                         "the outline star is filled in")
 
 
+class BubbleTeardownTest(unittest.TestCase):
+    """A bubble must stop its own pending work before it is deleted.
+
+    WHAT THIS CAN AND CANNOT PROVE
+    ==============================
+    The reported crash was a Windows access violation inside
+    ``message_bubble.on_finished``, reached through Qt's event loop — a
+    queued ``QNetworkReply.finished`` arriving at a closure whose QLabel had
+    just been freed with its parent bubble. That cannot be reproduced in a
+    test: it needs the reply to complete during the destruction itself, and a
+    deleted wrapper that PyQt still believes is valid. When PyQt DOES know,
+    it raises RuntimeError instead, which is the harmless case.
+
+    So these assert the contract that makes the crash impossible — the work
+    is disconnected and aborted before teardown, and every callback bails on
+    a dead widget — rather than claiming to reproduce it.
+    """
+
+    class _Client:
+        api_key = "test-key"
+
+    IMAGE = "Result ![map](https://example.invalid/result.png)"
+
+    def setUp(self):
+        from rasid_components.gopilot_page import GoPilotPage
+        self.page = GoPilotPage(self._Client(), None)
+        self.page.resize(470, 760)
+        self.page.show()
+        for _ in range(15):
+            QGIS_APP.processEvents()
+        self.page.start_new_chat()
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.page._remove_empty_state()
+
+    def tearDown(self):
+        _destroy(self.page)
+        self.page = None
+
+    def _bubble_with_a_preview(self):
+        self.page.add_message(self.IMAGE, is_user=False, message_id=501)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        bubble = self.page._bubbles[-1]
+        self.assertTrue(
+            bubble._replies,
+            "no preview request was started, so this test proves nothing")
+        return bubble
+
+    def test_clearing_the_transcript_stops_pending_previews(self):
+        bubble = self._bubble_with_a_preview()
+        self.page._clear_transcript()
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.assertTrue(bubble._closing)
+        self.assertEqual(bubble._replies, [],
+                         "replies were left outstanding past teardown")
+
+    def test_page_cleanup_stops_them_too(self):
+        """Unload destroys the panel; the same work has to be stopped."""
+        bubble = self._bubble_with_a_preview()
+        self.page.cleanup()
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.assertTrue(bubble._closing)
+
+    def test_cleanup_is_safe_twice_and_on_an_idle_bubble(self):
+        bubble = self._bubble_with_a_preview()
+        bubble.cleanup()
+        bubble.cleanup()            # must not raise
+        plain = self.page.add_message("no results here", is_user=True,
+                                      message_id=9)
+        for _ in range(8):
+            QGIS_APP.processEvents()
+        self.page._bubbles[-1].cleanup()
+
+    def test_a_download_callback_bails_once_closing(self):
+        """The slots must not write to a button whose owner has gone.
+
+        These moved from the bubble to `downloads.DownloadButton` when both
+        panes were put on one controller, so the guard is tested where it
+        now lives. Same property: a download that lands after teardown has
+        nowhere to report to, and writing to a freed QPushButton is the
+        access violation this whole class exists about.
+        """
+        from rasid_components.downloads import DownloadButton
+        button = QPushButton("x")
+        controller = DownloadButton(
+            button, object(), "https://example.invalid/x.geojson",
+            add_layer=lambda path: None,
+            idle_text="Add", busy_text="Downloading…", done_text="Added")
+        try:
+            controller.cleanup()
+            # Each of these would touch the button if the guard were gone.
+            controller._on_progress(10, 100)
+            controller._on_downloaded("c:/nope.tif")
+            controller._on_error("boom")
+            controller._on_layers_gone(["someid"])
+            self.assertEqual(button.text(), "Add",
+                             "a callback wrote to the button after cleanup")
+        finally:
+            _destroy(button)
+
+    def test_a_callback_survives_a_widget_that_died_without_cleanup(self):
+        """Teardown order is not always ours to choose.
+
+        `_closing` covers the case where we tore the thing down. This covers
+        the other one: the widget is destroyed by its parent and the work in
+        flight finishes afterwards, with no cleanup call in between. Nothing
+        may escape — the callbacks run on the UI thread and an exception
+        there is an error dialog over the user's map at best.
+
+        Previously this called two bubble methods that no longer exist, and
+        it SKIPPED on every run (it bailed when the widget had not been
+        reaped), so it never noticed. It drives the controller now, where
+        that guard lives.
+        """
+        from rasid_components.downloads import DownloadButton
+        button = QPushButton("x")
+        controller = DownloadButton(
+            button, object(), "https://example.invalid/x.geojson",
+            add_layer=lambda path: None,
+            idle_text="Add", busy_text="Downloading…", done_text="Added")
+        # Destroyed WITHOUT controller.cleanup(), so `_closing` is still
+        # False and only the RuntimeError guard can save these.
+        _destroy(button)
+        controller._on_progress(10, 100)
+        controller._on_downloaded("c:/nope.tif")
+        controller._on_error("boom")
+        controller.cleanup()
+
+
+class StaleReplyTest(unittest.TestCase):
+    """A new prompt must not be answered with the previous reply.
+
+    `GET sessions/tasks/{id}/` carries an `llm_message`, and until the worker
+    has written this turn's row that field can still hold the PREVIOUS turn's
+    message — complete, with its own thinking and tool calls. Rendering it is
+    why sending "Fetch me buildings" came back with "Hello, I am GoPilot".
+    """
+
+    def _thread(self, known=()):
+        from rasid_components.chat_threads import SendMessageThread
+        return SendMessageThread(None, "a new question", session_id="s1",
+                                 known_message_ids=known)
+
+    def test_a_message_already_on_screen_is_rejected(self):
+        thread = self._thread(known={"901"})
+        previous = {"id": 901, "content": "Hello, I am GoPilot",
+                    "thinking_content": "greeting",
+                    "tool_calls_content": [{"id": 1, "name": "x"}]}
+        self.assertFalse(thread._is_this_turn(previous))
+
+    def test_a_new_message_is_accepted(self):
+        thread = self._thread(known={"901"})
+        self.assertTrue(thread._is_this_turn(
+            {"id": 902, "content": "Fetching the buildings…"}))
+
+    def test_ids_compare_as_strings(self):
+        """The API sends ints here and strings elsewhere."""
+        thread = self._thread(known={"901"})
+        self.assertFalse(thread._is_this_turn({"id": "901", "content": "x"}))
+        self.assertFalse(thread._is_this_turn({"id": 901, "content": "x"}))
+
+    def test_an_empty_shell_is_rejected(self):
+        """The row exists but nothing has been written to it yet.
+
+        Rendering it would blank a bubble that currently reads "Thinking…".
+        The SaaS makes the same check in `hasAnyStreamedField`.
+        """
+        thread = self._thread()
+        self.assertFalse(thread._is_this_turn({"id": 903}))
+        self.assertFalse(thread._is_this_turn(
+            {"id": 903, "content": "", "thinking_content": ""}))
+
+    def test_a_message_with_only_files_is_accepted(self):
+        """A turn can answer with a layer and no prose."""
+        thread = self._thread()
+        self.assertTrue(thread._is_this_turn(
+            {"id": 904, "files": [{"id": 7}]}))
+
+    def test_a_message_with_no_id_is_accepted(self):
+        """Absent id cannot be matched against anything; do not drop the turn."""
+        thread = self._thread(known={"901"})
+        self.assertTrue(thread._is_this_turn({"content": "an answer"}))
+
+    def test_the_timeout_fallback_will_not_return_a_known_message(self):
+        """Walking back from the end finds the previous answer just as well."""
+        class Gopilot:
+            def get_messages(self, session_id):
+                return [{"id": 900, "role": "user", "content": "hi"},
+                        {"id": 901, "role": "assistant", "content": "Hello"}]
+
+        self.assertIsNone(self._thread(known={"901"})
+                          ._last_assistant_message(Gopilot()))
+        self.assertIsNotNone(self._thread()
+                             ._last_assistant_message(Gopilot()))
+
+    def test_the_poll_loop_never_emits_the_previous_turn(self):
+        """The guard has to be IN the loop, not just available to it.
+
+        Drives `_await_task` against a task that reports the previous turn's
+        message for its first two polls — which is what the real one does
+        before the worker writes this turn's row — and asserts the UI is
+        never handed it. Asserting `_is_this_turn` alone passed happily with
+        the call site removed.
+        """
+        from rasid_components import chat_threads
+
+        PREVIOUS = {"id": 901, "content": "Hello, I am GoPilot",
+                    "thinking_content": "greeting",
+                    "tool_calls_content": [{"id": 1, "name": "x"}]}
+        FRESH = {"id": 902, "content": "Fetching the buildings…"}
+
+        class Gopilot:
+            def __init__(self):
+                self.polls = 0
+
+            def get_task_status(self, task_id):
+                self.polls += 1
+                if self.polls <= 2:
+                    return {"status": "processing", "llm_message": PREVIOUS}
+                return {"status": "completed", "llm_message": FRESH}
+
+        thread = self._thread(known={"901"})
+        seen = []
+        thread.partial.connect(lambda message: seen.append(message))
+
+        original = chat_threads.POLL_INTERVAL
+        chat_threads.POLL_INTERVAL = 0        # do not sleep 2s per poll
+        try:
+            final = thread._await_task(Gopilot(), "task-1")
+        finally:
+            chat_threads.POLL_INTERVAL = original
+
+        self.assertNotIn(PREVIOUS, seen,
+                         "the previous turn was streamed into the new bubble")
+        self.assertEqual(seen, [FRESH])
+        self.assertEqual(final, FRESH,
+                         "the turn was committed with the wrong message")
+
+    def test_the_page_supplies_what_it_is_showing(self):
+        from rasid_components.gopilot_page import GoPilotPage
+        page = GoPilotPage(None, None)
+        page.show()
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        try:
+            page.start_new_chat()
+            for _ in range(10):
+                QGIS_APP.processEvents()
+            page._remove_empty_state()
+            page.add_message("q", is_user=True, message_id=11)
+            page.add_message("a", is_user=False, message_id=12)
+            page.add_message("no id yet", is_user=False)
+            for _ in range(10):
+                QGIS_APP.processEvents()
+            self.assertEqual(page._rendered_message_ids(), {"11", "12"})
+        finally:
+            _destroy(page)
+
+
+class DrawRestartTest(unittest.TestCase):
+    """Starting a draw while one is running must not abandon the live tool.
+
+    `GeometryInputManager._draw_tool` is the ONLY strong reference to the map
+    tool: QgsMapTool takes the canvas in its constructor but the canvas does
+    not own the tool. Overwriting that attribute therefore let Python free the
+    C++ tool while the canvas was still pointing at it, and the next mouse
+    event over the map read freed memory — a crash while drawing an AoI.
+    """
+
+    def setUp(self):
+        from qgis.gui import QgsMapCanvas
+        from rasid_components.geometry import GeometryInputManager
+        self.host = QMainWindow()
+        self.canvas = QgsMapCanvas(self.host)
+        self.host.setCentralWidget(self.canvas)
+        self.host.resize(800, 600)
+        self.host.show()
+        for _ in range(15):
+            QGIS_APP.processEvents()
+
+        test = self
+
+        class FakeIface:
+            def mainWindow(self):
+                return test.host
+
+            def mapCanvas(self):
+                return test.canvas
+
+        self.page = QWidget(self.host)
+        self.manager = GeometryInputManager(FakeIface(),
+                                            parent_widget=self.page)
+
+    def tearDown(self):
+        try:
+            self.manager.cancel_draw_mode()
+        except Exception:
+            pass
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        self.manager = None
+        _destroy(self.host)
+        self.host = None
+
+    def _start(self):
+        self.manager.start_draw_mode(show_help=False)
+        for _ in range(15):
+            QGIS_APP.processEvents()
+        return self.manager._draw_tool
+
+    def test_restarting_replaces_the_tool_on_the_canvas(self):
+        first = self._start()
+        self.assertIs(self.canvas.mapTool(), first)
+        second = self._start()
+        self.assertIsNot(second, first)
+        self.assertIs(
+            self.canvas.mapTool(), second,
+            "the canvas still points at a tool the manager has dropped")
+
+    def test_the_previous_tool_is_never_one_of_ours(self):
+        """Otherwise finishing restores the canvas to a deleted tool."""
+        from rasid_components.geometry.modern_draw_tool import ModernDrawTool
+        self._start()
+        self._start()
+        self.assertNotIsInstance(self.manager._prev_map_tool, ModernDrawTool)
+
+    def test_the_abandoned_tool_can_no_longer_deliver_geometry(self):
+        """The property only the teardown produces.
+
+        Without it the first tool is merely dropped: still connected to
+        `_on_draw_finished`, still holding its rubber band on the canvas, and
+        relying on Python's garbage collector to free a QgsMapTool that QGIS
+        may still hold internal pointers to. Tearing it down disconnects it,
+        so a stale tool cannot hand geometry to a manager that has moved on.
+        """
+        received = []
+        self.manager.geometry_ready.connect(
+            lambda payload: received.append(payload))
+
+        first = self._start()
+        self._start()
+
+        first.polygon_finished.emit([[0, 0], [1, 0], [1, 1], [0, 0]])
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.assertEqual(
+            received, [],
+            "a tool the manager had replaced still delivered geometry")
+
+    def test_the_canvas_survives_mouse_events_after_a_restart(self):
+        """This is where the dangling tool pointer was dereferenced."""
+        # QPointF, not QPoint: Qt6's QMouseEvent has no QPoint overload, and
+        # Qt5 takes the float form happily, so this is the one spelling that
+        # builds an event on both.
+        from qgis.PyQt.QtCore import QEvent, QPointF, Qt
+        from qgis.PyQt.QtGui import QMouseEvent
+        self._start()
+        self._start()
+        for _ in range(5):
+            QGIS_APP.sendEvent(self.canvas.viewport(), QMouseEvent(
+                QEvent.Type.MouseMove, QPointF(80, 80),
+                Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier))
+        for _ in range(10):
+            QGIS_APP.processEvents()
+
+    def test_finishing_after_a_restart_leaves_no_draw_tool_behind(self):
+        self._start()
+        self._start()
+        self.manager._on_draw_finished([[0, 0], [1, 0], [1, 1], [0, 0]])
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            QGIS_APP.processEvents()
+        self.assertIsNone(self.manager._draw_tool)
+        from rasid_components.geometry.modern_draw_tool import ModernDrawTool
+        self.assertNotIsInstance(self.canvas.mapTool(), ModernDrawTool)
+
+
+class DownloadButtonTest(unittest.TestCase):
+    """The download control, which used to be a one-way trip.
+
+    Both panes that download a result ran the same two faults, because the
+    code was written twice:
+
+    1. On success the button was disabled and relabelled for good. Removing
+       the layer from QGIS did not bring it back, so the only way to get the
+       layer again was to leave the pane and return, which rebuilt it.
+    2. The label said "Downloading…" and nothing more, so a large file and a
+       stalled plugin looked identical.
+    """
+
+    GEOJSON = ('{"type":"FeatureCollection","features":[{"type":"Feature",'
+               '"properties":{},"geometry":{"type":"Polygon","coordinates":'
+               '[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}}]}')
+
+    class _Client:
+        """Writes the file in pieces, reporting progress as a real one does."""
+
+        def __init__(self, source, fail=False):
+            self.source = source
+            self.calls = 0
+            self.fail = fail
+
+        def download_file(self, url, dest_dir=None, progress=None):
+            self.calls += 1
+            if self.fail:
+                raise RuntimeError("503 Service Unavailable")
+            with open(self.source, "rb") as fh:
+                data = fh.read()
+            target = os.path.join(dest_dir or os.path.dirname(self.source),
+                                  "result.geojson")
+            step = max(1, len(data) // 4)
+            written = 0
+            with open(target, "wb") as fh:
+                for start in range(0, len(data), step):
+                    chunk = data[start:start + step]
+                    fh.write(chunk)
+                    written += len(chunk)
+                    if progress:
+                        progress(written, len(data))
+            return target
+
+    def setUp(self):
+        import tempfile
+        from qgis.core import QgsProject
+        QgsProject.instance().removeAllMapLayers()
+        self._dir = tempfile.mkdtemp(prefix="dlbtn_")
+        self.source = os.path.join(self._dir, "result.geojson")
+        with open(self.source, "w", encoding="utf-8") as fh:
+            fh.write(self.GEOJSON)
+        self.button = QPushButton()
+        self.button.show()
+        self.labels = []
+        self._controllers = []
+        self.added = []
+        for _ in range(10):
+            QGIS_APP.processEvents()
+
+    def tearDown(self):
+        from qgis.core import QgsProject
+        for controller in self._controllers:
+            controller.cleanup()
+        QgsProject.instance().removeAllMapLayers()
+        _destroy(self.button)
+
+    def _controller(self, client=None, add_layer=None):
+        from rasid_components.downloads import DownloadButton
+        from qgis.core import QgsProject, QgsVectorLayer
+
+        def default_add(path):
+            layer = QgsVectorLayer(path, "probe result", "ogr")
+            QgsProject.instance().addMapLayer(layer)
+            self.added.append(layer)
+            return layer
+
+        original = self.button.setText
+
+        def record(text):
+            self.labels.append(text)
+            original(text)
+
+        self.button.setText = record
+        controller = DownloadButton(
+            self.button, client or self._Client(self.source),
+            "https://example.invalid/r.geojson",
+            add_layer or default_add,
+            idle_text="Add result to QGIS", busy_text="Downloading…",
+            done_text="Added result")
+        self._controllers.append(controller)
+        return controller
+
+    def _settle(self, timeout_ms=2000):
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            QGIS_APP.processEvents()
+
+    def _layer_present(self):
+        from qgis.core import QgsProject
+        return any(l.name() == "probe result"
+                   for l in QgsProject.instance().mapLayers().values())
+
+    # ── progress ────────────────────────────────────────────────────────────
+    def test_the_label_counts_up_while_downloading(self):
+        controller = self._controller()
+        controller.start()
+        self._settle()
+        with_percent = [t for t in self.labels if "%" in t]
+        self.assertTrue(
+            with_percent,
+            f"no progress was reported; labels were {self.labels}")
+
+    def test_bytes_are_shown_when_the_server_sends_no_length(self):
+        """A chunked response has no Content-Length to divide by."""
+        from rasid_components.downloads import progress_text
+        self.assertEqual(progress_text("Downloading…", 512, 0),
+                         "Downloading… 512 bytes")
+        self.assertEqual(progress_text("Downloading…", 45, 100),
+                         "Downloading… 45%")
+        self.assertEqual(progress_text("Downloading…", 0, 0), "Downloading…")
+
+    def test_a_percentage_is_never_out_of_range(self):
+        """A server that over-reports its own length must not read 143%."""
+        from rasid_components.downloads import progress_text
+        self.assertEqual(progress_text("x", 200, 100), "x 100%")
+        self.assertEqual(progress_text("x", -5, 100), "x 0%")
+
+    # ── the extension, which QGIS needs to open anything ────────────────────
+    def test_the_downloaded_file_keeps_its_extension(self):
+        """Through the REAL thread, because that is where this is restored.
+
+        A result URL ends in "/download/" with no extension, so the saved
+        file is called "download" and QGIS refuses it outright:
+        `Cannot open ...\\rasid_download_xxxx\\download`. The thread rebuilds
+        the suffix from the filename — and the controller has to pass that
+        filename on, which it did not, so every chat download broke.
+
+        The other tests here stub `download_file` and never look at the
+        name, so none of them noticed.
+        """
+        from rasid_components.downloads import DownloadButton
+        import tempfile
+
+        class Client:
+            """Saves to "download", the way an extensionless URL does."""
+
+            def download_file(self, url, dest_dir=None, progress=None):
+                target = os.path.join(dest_dir or tempfile.mkdtemp(),
+                                      "download")
+                with open(target, "wb") as fh:
+                    fh.write(b"{}")
+                return target
+
+        seen = []
+        button = QPushButton()
+        controller = DownloadButton(
+            button, Client(),
+            "https://app.gopilot.earth/api/llm/files/77/download/",
+            add_layer=lambda path: seen.append(path),
+            idle_text="Add", busy_text="Downloading…", done_text="Added",
+            filename="ndvi_jan2026_colored.tif")
+        try:
+            controller.start()
+            self._settle()
+            self.assertTrue(seen, "the download never completed")
+            self.assertTrue(
+                seen[0].endswith(".tif"),
+                f"QGIS cannot open this: {seen[0]!r}")
+        finally:
+            controller.cleanup()
+            _destroy(button)
+
+    def test_the_filename_reaches_the_download_thread(self):
+        """Dropping it is what broke this, so it is asserted directly."""
+        from rasid_components.downloads import DownloadButton
+        button = QPushButton()
+        controller = DownloadButton(
+            button, None, "https://example.invalid/files/1/download/",
+            add_layer=lambda path: None,
+            idle_text="Add", busy_text="…", done_text="Added",
+            filename="result.gpkg")
+        try:
+            self.assertEqual(controller.filename, "result.gpkg")
+        finally:
+            controller.cleanup()
+            _destroy(button)
+
+    # ── the added state is not terminal ─────────────────────────────────────
+    def test_the_button_stays_usable_after_a_successful_add(self):
+        controller = self._controller()
+        controller.start()
+        self._settle()
+        self.assertEqual(self.button.text(), "Added result")
+        self.assertTrue(
+            self.button.isEnabled(),
+            "the button was disabled for good, so the layer cannot be re-added")
+
+    def test_removing_the_layer_returns_the_button_to_idle(self):
+        """The reported bug: no way back without reopening the pane."""
+        from qgis.core import QgsProject
+        controller = self._controller()
+        controller.start()
+        self._settle()
+        QgsProject.instance().removeMapLayer(self.added[0].id())
+        self._settle(500)
+        self.assertEqual(self.button.text(), "Add result to QGIS")
+        self.assertTrue(self.button.isEnabled())
+
+    def test_adding_again_reuses_the_downloaded_file(self):
+        """Results are immutable, so a second fetch would be waste."""
+        client = self._Client(self.source)
+        controller = self._controller(client)
+        controller.start()
+        self._settle()
+        self.assertEqual(client.calls, 1)
+        controller.start()
+        self._settle(1000)
+        self.assertEqual(client.calls, 1, "it downloaded the file twice")
+        self.assertTrue(self._layer_present())
+
+    def test_removing_another_layer_does_not_reset_the_button(self):
+        from qgis.core import QgsProject, QgsVectorLayer
+        controller = self._controller()
+        controller.start()
+        self._settle()
+        other = QgsVectorLayer(self.source, "something else", "ogr")
+        QgsProject.instance().addMapLayer(other)
+        self._settle(300)
+        QgsProject.instance().removeMapLayer(other.id())
+        self._settle(300)
+        self.assertEqual(self.button.text(), "Added result")
+
+    # ── failures ────────────────────────────────────────────────────────────
+    def test_a_failed_download_offers_a_retry(self):
+        controller = self._controller(self._Client(self.source, fail=True))
+        controller.start()
+        self._settle()
+        self.assertTrue(self.button.isEnabled())
+        self.assertIn("Retry", self.button.text())
+
+    def test_a_failed_add_offers_a_retry(self):
+        def boom(path):
+            raise RuntimeError("QGIS could not open it")
+
+        controller = self._controller(add_layer=boom)
+        controller.start()
+        self._settle()
+        self.assertTrue(self.button.isEnabled())
+        self.assertIn("Retry", self.button.text())
+
+    def test_an_existing_layer_shows_the_loaded_state(self):
+        """A pane reopened later, with the layer still in the project."""
+        from qgis.core import QgsProject, QgsVectorLayer
+        layer = QgsVectorLayer(self.source, "probe result", "ogr")
+        QgsProject.instance().addMapLayer(layer)
+        controller = self._controller()
+        controller.mark_loaded("probe result")
+        self.assertEqual(self.button.text(), "Added result")
+        self.assertTrue(self.button.isEnabled())
+        QgsProject.instance().removeMapLayer(layer.id())
+        self._settle(400)
+        self.assertEqual(self.button.text(), "Add result to QGIS")
+
+    def test_cleanup_lets_go_of_the_project_signal(self):
+        """A slot left connected is called while the widget is destroyed."""
+        from qgis.core import QgsProject
+        controller = self._controller()
+        controller.start()
+        self._settle()
+        controller.cleanup()
+        # Removing the layer now must not touch the button.
+        QgsProject.instance().removeMapLayer(self.added[0].id())
+        self._settle(400)
+        self.assertEqual(self.button.text(), "Added result")
+
+    # ── auto-load must not duplicate ────────────────────────────────────────
+    def test_auto_load_fires_once_per_result(self):
+        """`set_content` re-renders on every poll of a streaming reply.
+
+        The old guard was "click every ENABLED button", which worked only
+        because a loaded button stayed disabled. Now that it stays
+        clickable, that guard would add a second copy of every layer on each
+        re-render.
+        """
+        from rasid_components.message_bubble import MessageBubble
+        url = "https://app.gopilot.earth/api/llm/files/55/download/"
+        started = []
+
+        class StubClient:
+            api_key = "k"
+
+        bubble = MessageBubble(f"result [r.geojson]({url})", role="ai",
+                               client=StubClient(), message_id=5)
+        try:
+            for _ in range(8):
+                QGIS_APP.processEvents()
+            for controller in bubble._downloads:
+                controller.start = lambda c=controller: started.append(c.url)
+            bubble._auto_load()
+            bubble._auto_load()
+            bubble._auto_load()
+            self.assertEqual(
+                len(started), 1,
+                f"auto-load fired {len(started)} times for one result")
+        finally:
+            bubble.cleanup()
+            _destroy(bubble)
+
+
+class LayerStylingTest(unittest.TestCase):
+    """Result layers are drawn the way the server says, not at random.
+
+    Every result file may carry an ``sld`` — a Styled Layer Descriptor — and
+    applying it is what makes a layer land in QGIS looking like it does on
+    the website instead of in a random colour.
+
+    The plugin could not do this at all, for a reason that had nothing to do
+    with styling: results are discovered by reading the message TEXT for
+    links, which yields a URL and a filename, so the API's own file list —
+    where the style, type and id live — was never looked at. The style was
+    discarded two steps before anything could use it.
+    """
+
+    SLD = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<StyledLayerDescriptor version="1.0.0"'
+        ' xmlns="http://www.opengis.net/sld"'
+        ' xmlns:ogc="http://www.opengis.net/ogc">'
+        '<NamedLayer><Name>b</Name><UserStyle><FeatureTypeStyle><Rule>'
+        '<PolygonSymbolizer>'
+        '<Fill><CssParameter name="fill">#FF00AA</CssParameter></Fill>'
+        '<Stroke><CssParameter name="stroke">#003366</CssParameter>'
+        '<CssParameter name="stroke-width">2</CssParameter></Stroke>'
+        '</PolygonSymbolizer>'
+        '</Rule></FeatureTypeStyle></UserStyle></NamedLayer>'
+        '</StyledLayerDescriptor>'
+    )
+    GEOJSON = ('{"type":"FeatureCollection","features":[{"type":"Feature",'
+               '"properties":{"n":1},"geometry":{"type":"Polygon",'
+               '"coordinates":[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}}]}')
+    URL = "https://app.gopilot.earth/api/llm/files/4242/download/"
+
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.mkdtemp(prefix="sldtest_")
+        self.geojson = os.path.join(self._dir, "buildings.geojson")
+        with open(self.geojson, "w", encoding="utf-8") as fh:
+            fh.write(self.GEOJSON)
+        self._saved = (prefs.get_bool(prefs.LAYER_GROUP_ENABLED),
+                       prefs.get_bool(prefs.ZOOM_TO_LAYER))
+        prefs.set_value(prefs.LAYER_GROUP_ENABLED, False)
+        prefs.set_value(prefs.ZOOM_TO_LAYER, False)
+        self._bubbles = []
+
+    def tearDown(self):
+        from qgis.core import QgsProject
+        QgsProject.instance().removeAllMapLayers()
+        for bubble in self._bubbles:
+            bubble.cleanup()
+            _destroy(bubble)
+        prefs.set_value(prefs.LAYER_GROUP_ENABLED, self._saved[0])
+        prefs.set_value(prefs.ZOOM_TO_LAYER, self._saved[1])
+
+    def _files(self, sld=None):
+        return [{"id": 4242, "message_id": 77, "name": "buildings.geojson",
+                 "file_url": self.URL, "file_type": "geojson", "sld": sld}]
+
+    def _bubble(self, files):
+        from rasid_components.message_bubble import MessageBubble
+        bubble = MessageBubble(
+            f"Here you go [buildings.geojson]({self.URL})",
+            role="ai", client=None, message_id=77, files=files)
+        self._bubbles.append(bubble)
+        for _ in range(8):
+            QGIS_APP.processEvents()
+        return bubble
+
+    def _load(self, name, sld):
+        from rasid_components.message_bubble import add_layer_to_qgis
+        from qgis.core import QgsProject
+        add_layer_to_qgis(self.geojson, name, None, sld=sld)
+        for layer in QgsProject.instance().mapLayers().values():
+            if layer.name() == name:
+                return layer
+        return None
+
+    # ── finding the style for a result ──────────────────────────────────────
+    def test_the_bubble_finds_the_style_for_its_own_file(self):
+        bubble = self._bubble(self._files(self.SLD))
+        self.assertEqual(bubble.style_for(self.URL), self.SLD)
+
+    def test_a_presigned_url_still_matches(self):
+        """`file_url` can carry a signature the link in the text does not."""
+        bubble = self._bubble(self._files(self.SLD))
+        self.assertEqual(bubble.style_for(self.URL + "?X-Amz-Signature=abc"),
+                         self.SLD)
+
+    def test_another_files_style_is_not_used(self):
+        bubble = self._bubble(self._files(self.SLD))
+        self.assertIsNone(bubble.style_for(
+            "https://app.gopilot.earth/api/llm/files/9999/download/"))
+
+    def test_no_file_list_is_not_an_error(self):
+        """Messages predating this, and any message with no results."""
+        bubble = self._bubble(None)
+        self.assertIsNone(bubble.style_for(self.URL))
+
+    # ── applying it ─────────────────────────────────────────────────────────
+    def test_the_style_reaches_the_layer(self):
+        layer = self._load("styled", self.SLD)
+        self.assertIsNotNone(layer)
+        symbol = layer.renderer().symbol()
+        self.assertEqual(symbol.color().name().lower(), "#ff00aa")
+        self.assertEqual(
+            symbol.symbolLayer(0).strokeColor().name().lower(), "#003366")
+
+    def test_a_layer_with_no_style_still_loads(self):
+        self.assertIsNotNone(self._load("plain", None))
+
+    def test_junk_in_the_style_field_does_not_fail_the_load(self):
+        """A visible layer in the wrong colours beats no layer at all."""
+        for junk in ('{"not": "an sld"}', "<html>nope</html>", "", "   "):
+            name = f"junk{abs(hash(junk)) % 1000}"
+            self.assertIsNotNone(self._load(name, junk), junk)
+
+    def test_an_sld_is_recognised_by_its_root_element(self):
+        from rasid_components.layer_style import is_sld
+        self.assertTrue(is_sld(self.SLD))
+        self.assertTrue(is_sld('<sld:StyledLayerDescriptor/>'))
+        for bad in (None, "", "   ", 42, '{"json": true}', "<qgis/>"):
+            self.assertFalse(is_sld(bad), repr(bad))
+
+    def test_no_temporary_style_files_are_left_behind(self):
+        """`loadSldStyle` needs a file, and QGIS sessions run for days."""
+        import tempfile
+        before = {n for n in os.listdir(tempfile.gettempdir())
+                  if n.startswith("gopilot_style_")}
+        self._load("styled2", self.SLD)
+        after = {n for n in os.listdir(tempfile.gettempdir())
+                 if n.startswith("gopilot_style_")}
+        self.assertEqual(after - before, set())
+
+    def _filtered_sld(self, field, values):
+        rules = ""
+        for colour, value in zip(("#FF0000", "#00FF00"), values):
+            rules += (
+                f'<Rule><Name>{value}</Name>'
+                f'<ogc:Filter xmlns:ogc="http://www.opengis.net/ogc">'
+                f'<ogc:PropertyIsEqualTo>'
+                f'<ogc:PropertyName>{field}</ogc:PropertyName>'
+                f'<ogc:Literal>{value}</ogc:Literal>'
+                f'</ogc:PropertyIsEqualTo></ogc:Filter>'
+                f'<PolygonSymbolizer><Fill>'
+                f'<CssParameter name="fill">{colour}</CssParameter>'
+                f'</Fill></PolygonSymbolizer></Rule>')
+        return ('<?xml version="1.0"?>'
+                '<StyledLayerDescriptor version="1.0.0"'
+                ' xmlns="http://www.opengis.net/sld">'
+                '<NamedLayer><Name>g</Name><UserStyle><FeatureTypeStyle>'
+                f'{rules}'
+                '</FeatureTypeStyle></UserStyle></NamedLayer>'
+                '</StyledLayerDescriptor>')
+
+    def _classed_geojson(self):
+        """Two features carrying `size_class`, as a result layer would."""
+        import tempfile
+        data = ('{"type":"FeatureCollection","features":['
+                '{"type":"Feature","properties":{"size_class":"largest"},'
+                '"geometry":{"type":"Polygon","coordinates":'
+                '[[[0,0],[1,0],[1,1],[0,1],[0,0]]]}},'
+                '{"type":"Feature","properties":{"size_class":"middle"},'
+                '"geometry":{"type":"Polygon","coordinates":'
+                '[[[2,0],[3,0],[3,1],[2,1],[2,0]]]}}]}')
+        path = os.path.join(self._dir, "classed.geojson")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        return path
+
+    def _draws_something(self, layer):
+        from qgis.core import (QgsExpression, QgsExpressionContext,
+                               QgsExpressionContextUtils)
+        renderer = layer.renderer()
+        root = getattr(renderer, "rootRule", None)
+        if root is None:
+            return True
+        context = QgsExpressionContext()
+        context.appendScope(QgsExpressionContextUtils.layerScope(layer))
+        for feature in layer.getFeatures():
+            context.setFeature(feature)
+            for rule in root().children():
+                text = rule.filterExpression()
+                if not text or QgsExpression(text).evaluate(context):
+                    return True
+        return False
+
+    def test_a_style_whose_filters_match_is_kept(self):
+        from qgis.core import QgsVectorLayer
+        from rasid_components.layer_style import apply_sld
+        layer = QgsVectorLayer(self._classed_geojson(), "ok", "ogr")
+        self.assertTrue(apply_sld(
+            layer, self._filtered_sld("size_class", ["largest", "middle"])))
+        self.assertTrue(self._draws_something(layer))
+
+    def test_a_style_that_would_draw_nothing_is_discarded(self):
+        """The reported symptom: loaded, ticked, legend shown, map empty.
+
+        An SLD's rules become a rule-based renderer, and one with no matching
+        rule and no catch-all draws NO features while still listing its
+        classes in the legend — indistinguishable from a broken download.
+        Measured: a style keyed on a field the data lacks renders 0 of 3.
+        """
+        from qgis.core import QgsVectorLayer
+        from rasid_components.layer_style import apply_sld
+        for field, values in (("name", ["Khufu", "Khafre"]),
+                              ("size_class", ["BIG", "SMALL"])):
+            layer = QgsVectorLayer(self._classed_geojson(), "bad", "ogr")
+            kept = apply_sld(layer, self._filtered_sld(field, values))
+            self.assertFalse(kept, f"{field}={values} should not be kept")
+            self.assertTrue(
+                self._draws_something(layer),
+                f"{field}={values}: the layer was left invisible")
+
+    def test_the_layer_keeps_a_working_renderer_after_a_discard(self):
+        """Reverted to what QGIS gave it, not left with a dead renderer."""
+        from qgis.core import QgsVectorLayer, QgsSingleSymbolRenderer
+        from rasid_components.layer_style import apply_sld
+        layer = QgsVectorLayer(self._classed_geojson(), "bad2", "ogr")
+        apply_sld(layer, self._filtered_sld("name", ["Khufu"]))
+        self.assertIsInstance(layer.renderer(), QgsSingleSymbolRenderer)
+
+    def test_an_unfiltered_style_is_never_second_guessed(self):
+        """No filters means it catches everything; do not inspect features."""
+        from qgis.core import QgsVectorLayer
+        from rasid_components.layer_style import apply_sld
+        layer = QgsVectorLayer(self._classed_geojson(), "plainsld", "ogr")
+        self.assertTrue(apply_sld(layer, self.SLD))
+        self.assertEqual(
+            layer.renderer().symbol().color().name().lower(), "#ff00aa")
+
+    def test_an_empty_layer_keeps_its_style(self):
+        """No features is an empty result, not a failing style."""
+        from qgis.core import QgsVectorLayer
+        from rasid_components.layer_style import apply_sld
+        path = os.path.join(self._dir, "empty.geojson")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"type":"FeatureCollection","features":[]}')
+        layer = QgsVectorLayer(path, "empty", "ogr")
+        if not layer.isValid():
+            self.skipTest("OGR would not open an empty FeatureCollection")
+        self.assertTrue(apply_sld(
+            layer, self._filtered_sld("size_class", ["largest"])))
+
+    def test_a_raster_is_skipped_rather_than_failing(self):
+        """QGIS refuses SLD on rasters — "Layer type 1 not supported".
+
+        Measured on 3.36.3 and 4.0.1 with a georeferenced raster and a real
+        RasterSymbolizer. Not a gap in this code: the website does not style
+        rasters either, it serves them as pre-rendered tiles with the
+        colouring already baked in.
+        """
+        from rasid_components.layer_style import apply_sld
+        from qgis.core import QgsRasterLayer
+        layer = QgsRasterLayer(self.geojson, "notaraster")   # invalid is fine
+        self.assertFalse(apply_sld(layer, self.SLD))
+
+    # ── the plumbing that was missing ───────────────────────────────────────
+    def test_the_page_hands_the_file_list_to_the_bubble(self):
+        from rasid_components.gopilot_page import GoPilotPage
+        page = GoPilotPage(None, None)
+        page.show()
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        try:
+            page.start_new_chat()
+            for _ in range(10):
+                QGIS_APP.processEvents()
+            page._remove_empty_state()
+            page.add_message(f"result [b.geojson]({self.URL})",
+                             is_user=False, message_id=77,
+                             files=self._files(self.SLD))
+            for _ in range(10):
+                QGIS_APP.processEvents()
+            self.assertEqual(page._bubbles[-1].style_for(self.URL), self.SLD)
+        finally:
+            _destroy(page)
+
+    def test_a_reloaded_chat_styles_its_layers_too(self):
+        """Not only a live turn: the loader reads `files` from the server."""
+        from rasid_components.gopilot_page import GoPilotPage
+        page = GoPilotPage(None, None)
+        page.show()
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        try:
+            page._on_messages_loaded([{
+                "id": 77, "role": "assistant", "is_user": False,
+                "content": f"result [b.geojson]({self.URL})",
+                "files": self._files(self.SLD),
+            }])
+            for _ in range(12):
+                QGIS_APP.processEvents()
+            self.assertEqual(page._bubbles[-1].style_for(self.URL), self.SLD)
+        finally:
+            _destroy(page)
+
+
+class MessageIdReconcileTest(unittest.TestCase):
+    """A just-sent prompt has to get its server id without a page reload.
+
+    The panel draws the user's message immediately rather than waiting for a
+    round trip to echo it, so that bubble has no server row behind it. Two
+    things need one, and both looked to the user like "you have to leave the
+    page and come back":
+
+    * the trash control, hidden until there is something to ask the server
+      to delete;
+    * `_on_message_deleted`, which removes bubbles BY id — so trashing a
+      reply left its id-less prompt behind as an orphan.
+
+    Reopening the chat fixed both because it refetched the transcript. This
+    does the same refetch without rebuilding anything.
+    """
+
+    ROWS = [
+        {"id": 500, "is_user": True, "content": "map the dam"},
+        {"id": 501, "is_user": False, "content": "Here it is."},
+    ]
+
+    class _Gopilot:
+        def __init__(self, rows):
+            self.rows = rows
+            self.calls = 0
+
+        def get_messages(self, session_id):
+            self.calls += 1
+            return list(self.rows)
+
+    class _Client:
+        api_key = "k"
+
+        def __init__(self, rows):
+            self.gopilot = MessageIdReconcileTest._Gopilot(rows)
+
+    def _page(self, rows=None):
+        from rasid_components.gopilot_page import GoPilotPage
+        page = GoPilotPage(self._Client(self.ROWS if rows is None else rows),
+                           None)
+        page.resize(470, 760)
+        page.show()
+        for _ in range(15):
+            QGIS_APP.processEvents()
+        page.start_new_chat()
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        page.current_chat_id = "sess-1"
+        page._remove_empty_state()
+        self._pages.append(page)
+        return page
+
+    def _settle(self, timeout_ms=1500):
+        """Let the fetch thread actually run; pumping alone will not."""
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            QGIS_APP.processEvents()
+
+    def setUp(self):
+        self._pages = []
+
+    def tearDown(self):
+        for page in self._pages:
+            _destroy(page)
+        self._pages = []
+
+    def test_a_just_sent_prompt_starts_without_an_id_or_a_trash(self):
+        """The starting condition — otherwise the rest proves nothing."""
+        page = self._page()
+        page.add_message("map the dam", is_user=True)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        bubble = page._bubbles[-1]
+        self.assertIsNone(bubble.message_id)
+        self.assertFalse(bubble._trash_button.isVisible())
+
+    def test_the_prompt_gets_its_id_once_the_turn_lands(self):
+        page = self._page()
+        page.add_message("map the dam", is_user=True)
+        page.add_message("Here it is.", is_user=False, message_id=501)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        page._reconcile_message_ids()
+        self._settle()
+        prompt = page._bubbles[0]
+        self.assertEqual(prompt.message_id, 500)
+        self.assertTrue(prompt._trash_button.isVisible(),
+                        "the trash is still hidden on a sent message")
+
+    def test_trashing_the_reply_then_removes_the_prompt_too(self):
+        page = self._page()
+        page.add_message("map the dam", is_user=True)
+        page.add_message("Here it is.", is_user=False, message_id=501)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        page._reconcile_message_ids()
+        self._settle()
+
+        # What the server reports after trashing the turn.
+        page._on_message_deleted([500, 501])
+        for _ in range(15):
+            QGIS_APP.processEvents()
+        self.assertEqual(page._bubbles, [],
+                         "an orphaned prompt was left on screen")
+
+    def test_matching_is_by_content_not_position(self):
+        """A system notice from a failed turn shifts the two lists apart.
+
+        Assigning by position would then give the prompt somebody else's id,
+        and its trash button would delete the wrong message.
+        """
+        page = self._page()
+        page._add_system_message("**Could not do that**", tone="error")
+        page.add_message("map the dam", is_user=True)
+        page.add_message("Here it is.", is_user=False, message_id=501)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        page._reconcile_message_ids()
+        self._settle()
+        by_role = {b.role: b.message_id for b in page._bubbles}
+        self.assertEqual(by_role.get("user"), 500)
+        self.assertIsNone(by_role.get("system"),
+                          "a system notice was given a server id")
+
+    def test_two_prompts_are_matched_by_their_text_not_their_order(self):
+        """The case where only the text tells them apart.
+
+        Both bubbles are prompts, so the role check cannot separate them, and
+        the server here answers newest-first. Taking the first unclaimed row
+        of the right role would give each bubble the OTHER one's id — and a
+        trash button that deletes the wrong message is worse than one that
+        does not appear.
+        """
+        rows = [{"id": 901, "is_user": True, "content": "beta"},
+                {"id": 900, "is_user": True, "content": "alpha"}]
+        page = self._page(rows)
+        page.add_message("alpha", is_user=True)
+        page.add_message("beta", is_user=True)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        page._reconcile_message_ids()
+        self._settle()
+        got = [(b.raw_text(), b.message_id) for b in page._bubbles]
+        self.assertEqual(got, [("alpha", 900), ("beta", 901)], got)
+
+    def test_a_prompt_never_takes_an_assistant_row_id(self):
+        """Roles must not be crossed, even on identical text.
+
+        Here the only server row is an assistant one, so the prompt has
+        nothing it may claim and the fallback rebuilds from the server. The
+        invariant that matters either way: that id belongs to an ASSISTANT
+        bubble and must never end up on a prompt, whose trash button would
+        then delete the reply instead.
+        """
+        rows = [{"id": 700, "is_user": False, "content": "same words"}]
+        page = self._page(rows)
+        page.add_message("same words", is_user=True)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        page._reconcile_message_ids()
+        self._settle()
+        for bubble in page._bubbles:
+            if bubble.message_id == 700:
+                self.assertEqual(
+                    bubble.role, "ai",
+                    "an assistant row's id landed on a prompt")
+
+    def test_an_id_already_on_screen_is_not_handed_out_twice(self):
+        """Two identical prompts must not end up as the same server row."""
+        rows = [{"id": 800, "is_user": True, "content": "again"},
+                {"id": 801, "is_user": True, "content": "again"}]
+        page = self._page(rows)
+        page.add_message("again", is_user=True)
+        page.add_message("again", is_user=True)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        page._reconcile_message_ids()
+        self._settle()
+        ids = [b.message_id for b in page._bubbles]
+        self.assertEqual(sorted(ids), [800, 801], ids)
+
+    def test_nothing_is_fetched_when_every_bubble_has_an_id(self):
+        """One round trip per turn is the budget; zero when there is no need."""
+        page = self._page()
+        page.add_message("map the dam", is_user=True, message_id=500)
+        page.add_message("Here it is.", is_user=False, message_id=501)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        page._reconcile_message_ids()
+        self._settle(400)
+        self.assertEqual(page.client.gopilot.calls, 0)
+
+    def test_an_unsaved_chat_fetches_nothing(self):
+        page = self._page()
+        page.current_chat_id = None
+        page.add_message("map the dam", is_user=True)
+        page._reconcile_message_ids()
+        self._settle(400)
+        self.assertEqual(page.client.gopilot.calls, 0)
+
+    def test_finishing_a_turn_reconciles_without_being_asked(self):
+        """The hook has to be IN `_on_reply`, not merely available to it.
+
+        Every other test here calls `_reconcile_message_ids` itself, so they
+        all keep passing with the call site deleted — which is precisely the
+        bug that was reported. This one goes through the turn.
+        """
+        page = self._page()
+        page.add_message("map the dam", is_user=True)
+        page._show_thinking()           # the bubble the reply streams into
+        for _ in range(10):
+            QGIS_APP.processEvents()
+
+        page._on_reply({
+            "session_id": "sess-1",
+            "message": "Here it is.",
+            "llm_message": {"id": 501, "content": "Here it is."},
+        })
+        self._settle()
+
+        prompt = page._bubbles[0]
+        self.assertEqual(prompt.role, "user")
+        self.assertEqual(
+            prompt.message_id, 500,
+            "finishing a turn left the prompt without its server id")
+        self.assertTrue(prompt._trash_button.isVisible())
+
+    def test_an_unmatchable_bubble_falls_back_to_a_rebuild(self):
+        """Matching on text cannot be trusted; the outcome still must be.
+
+        A server that trims, normalises or annotates what it stores will
+        never match, and a bubble left without an id is the whole bug — no
+        trash, and invisible to a delete. So the fallback does automatically
+        what reopening the chat did by hand.
+        """
+        rows = [{"id": 500, "is_user": True,
+                 "content": "map the dam [edited]"},
+                {"id": 501, "is_user": False, "content": "Here it is."}]
+        page = self._page(rows)
+        page.add_message("map the dam", is_user=True)
+        page.add_message("Here it is.", is_user=False, message_id=501)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        page._reconcile_message_ids()
+        self._settle()
+
+        ids = [b.message_id for b in page._bubbles]
+        self.assertNotIn(None, ids, f"a bubble was left with no id: {ids}")
+        self.assertTrue(all(b._trash_button.isVisible()
+                            for b in page._bubbles))
+
+    def test_a_successful_match_does_not_rebuild(self):
+        """The rebuild is the fallback, not the mechanism.
+
+        Rebuilding costs a flicker, the scroll position and every image
+        preview, so the normal path must leave the existing widgets alone.
+        Identity of the bubble objects is the test: a rebuild replaces them.
+        """
+        page = self._page()
+        page.add_message("map the dam", is_user=True)
+        page.add_message("Here it is.", is_user=False, message_id=501)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        before = list(page._bubbles)
+
+        page._reconcile_message_ids()
+        self._settle()
+
+        self.assertEqual([id(b) for b in page._bubbles],
+                         [id(b) for b in before],
+                         "the transcript was rebuilt when it did not need to be")
+        self.assertEqual(page._bubbles[0].message_id, 500)
+
+    def test_a_failed_refetch_is_silent(self):
+        """The ids are a nicety; a working turn must not sprout an error."""
+        class Boom:
+            def get_messages(self, session_id):
+                raise RuntimeError("503")
+
+        page = self._page()
+        page.client.gopilot = Boom()
+        page.add_message("map the dam", is_user=True)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        page._reconcile_message_ids()
+        self._settle()
+        roles = [b.role for b in page._bubbles]
+        self.assertNotIn("system", roles,
+                         "a failed id refetch put an error card in the chat")
+
+
+class TranscriptResyncAfterDeleteTest(unittest.TestCase):
+    """After a delete the server decides what is left, not id arithmetic.
+
+    Removing bubbles by the ids the delete reported is the optimistic half:
+    instant, and right whenever we hold an id for everything the server
+    trashed. It is not always right —
+
+    * the backend takes a whole TURN but a build that does not send
+      `trashed_ids` falls back to the single id we asked about;
+    * a prompt drawn locally this session may have had no id to match.
+
+    Either way the pair's other half stayed on screen as an orphan until the
+    chat was reopened. The SaaS never has this bug because its delete
+    invalidates the messages query and the list is rebuilt from the server.
+    """
+
+    class _Gopilot:
+        def __init__(self):
+            self.rows = [
+                {"id": 500, "is_user": True, "content": "turn one"},
+                {"id": 501, "is_user": False, "content": "answer one"},
+                {"id": 502, "is_user": True, "content": "turn two"},
+                {"id": 503, "is_user": False, "content": "answer two"},
+            ]
+
+        def get_messages(self, session_id):
+            return [dict(row) for row in self.rows]
+
+        def trash(self, *ids):
+            self.rows = [r for r in self.rows if r["id"] not in ids]
+
+    class _Client:
+        api_key = "k"
+
+        def __init__(self):
+            self.gopilot = TranscriptResyncAfterDeleteTest._Gopilot()
+
+    def setUp(self):
+        from rasid_components.gopilot_page import GoPilotPage
+        self.client = self._Client()
+        self.page = GoPilotPage(self.client, None)
+        self.page.resize(470, 760)
+        self.page.show()
+        for _ in range(15):
+            QGIS_APP.processEvents()
+        self.page.start_new_chat()
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.page.current_chat_id = "sess-1"
+        self.page._remove_empty_state()
+
+    def tearDown(self):
+        _destroy(self.page)
+        self.page = None
+
+    def _fill(self, with_ids=True):
+        for row in self.client.gopilot.rows:
+            self.page.add_message(
+                row["content"], is_user=row["is_user"],
+                message_id=row["id"] if with_ids else None)
+        for _ in range(15):
+            QGIS_APP.processEvents()
+
+    def _settle(self, timeout_ms=1500):
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            QGIS_APP.processEvents()
+
+    def _texts(self):
+        return [b.raw_text() for b in self.page._bubbles]
+
+    def test_an_orphan_is_cleared_when_only_one_id_was_reported(self):
+        self._fill()
+        self.client.gopilot.trash(502, 503)     # the server took the turn
+        self.page._on_message_deleted([503])    # but named only the reply
+        self._settle()
+        self.assertEqual(self._texts(), ["turn one", "answer one"],
+                         "the prompt was left behind as an orphan")
+
+    def test_an_orphan_is_cleared_when_the_prompt_had_no_id(self):
+        self._fill(with_ids=False)
+        for bubble in self.page._bubbles:
+            if bubble.role != "user":
+                for row in self.client.gopilot.rows:
+                    if row["content"] == bubble.raw_text():
+                        bubble.set_message_id(row["id"])
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        self.client.gopilot.trash(502, 503)
+        self.page._on_message_deleted([502, 503])
+        self._settle()
+        self.assertEqual(self._texts(), ["turn one", "answer one"])
+
+    def test_the_remaining_prompt_also_gets_its_id(self):
+        """So the NEXT delete does not strand anything either."""
+        self._fill(with_ids=False)
+        self.client.gopilot.trash(502, 503)
+        self.page._on_message_deleted([502, 503])
+        self._settle()
+        self.assertEqual(sorted(b.message_id for b in self.page._bubbles),
+                         [500, 501])
+
+    def test_a_correct_optimistic_update_is_not_rebuilt(self):
+        """No flicker when the ids already agreed with the server."""
+        self._fill()
+        before = list(self.page._bubbles)
+        self.client.gopilot.trash(502, 503)
+        self.page._on_message_deleted([502, 503])
+        self._settle()
+        kept = [b for b in before if b.raw_text() in ("turn one",
+                                                      "answer one")]
+        self.assertEqual([id(b) for b in self.page._bubbles],
+                         [id(b) for b in kept],
+                         "the transcript was rebuilt needlessly")
+
+    def test_an_emptied_session_goes_to_a_new_chat(self):
+        self.client.gopilot.rows = self.client.gopilot.rows[:2]
+        self._fill()
+        self.client.gopilot.trash(500, 501)
+        self.page._on_message_deleted([501])
+        self._settle()
+        self.assertEqual(self.page._bubbles, [])
+        self.assertIsNone(self.page.current_chat_id)
+        self.assertIsNotNone(self.page._empty_state)
+
+    def test_a_failed_resync_leaves_the_optimistic_update_alone(self):
+        class Boom:
+            def get_messages(self, session_id):
+                raise RuntimeError("503")
+
+        self._fill()
+        self.page.client.gopilot = Boom()
+        self.page._on_message_deleted([502, 503])
+        self._settle()
+        self.assertEqual(self._texts(), ["turn one", "answer one"])
+        self.assertNotIn("system", [b.role for b in self.page._bubbles],
+                         "a failed bookkeeping refetch added an error card")
+
+
+class DeletingAMessageTest(unittest.TestCase):
+    """What happens to the SESSION when an exchange is deleted.
+
+    The backend trashes a whole turn — asking it to delete a reply takes the
+    prompt with it, and vice versa, because there is no edit. So deleting
+    "one chat" always removes a pair, and the only question is whether the
+    session still has anything in it afterwards:
+
+    * one exchange, deleted  -> the session is now empty, which is the same
+      thing as having deleted the session, so go to a new chat;
+    * one of several, deleted -> there is still a conversation to read, so
+      nothing moves.
+
+    Not to be confused with deleting a SESSION from the History list, which
+    is :class:`DeletingAChatFromHistoryTest`.
+    """
+
+    def setUp(self):
+        self.shell = GoPilotShell(None)
+        self.shell.resize(470, 760)
+        self.shell.show()
+        for _ in range(20):
+            QGIS_APP.processEvents()
+        self.page = self.shell.chat_page
+
+    def tearDown(self):
+        self.page = None
+        _destroy(self.shell)
+        self.shell = None
+
+    def _session_with(self, exchanges):
+        """Returns the (user_id, bot_id) pairs now in the transcript."""
+        self.page.start_new_chat()
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.page.current_chat_id = "sess-1"
+        self.page._remove_empty_state()
+        pairs = []
+        for index in range(exchanges):
+            user_id, bot_id = 100 + index * 2, 101 + index * 2
+            self.page.add_message(f"question {index}", is_user=True,
+                                  message_id=user_id)
+            self.page.add_message(f"answer {index}", is_user=False,
+                                  message_id=bot_id)
+            pairs.append((user_id, bot_id))
+        for _ in range(20):
+            QGIS_APP.processEvents()
+        return pairs
+
+    def _delete(self, pair):
+        """What the server reports after trashing a turn: both ids."""
+        self.page._on_message_deleted(list(pair))
+        for _ in range(20):
+            QGIS_APP.processEvents()
+
+    # ── one exchange: deleting it empties the session ────────────────────────
+    def test_deleting_the_only_exchange_leaves_the_session(self):
+        pairs = self._session_with(1)
+        self._delete(pairs[0])
+        self.assertIsNone(self.page.current_chat_id,
+                          "still pointing at a session with nothing in it")
+
+    def test_deleting_the_only_exchange_shows_the_new_chat_page(self):
+        pairs = self._session_with(1)
+        self._delete(pairs[0])
+        self.assertIsNotNone(self.page._empty_state,
+                             "left looking at a blank transcript")
+
+    def test_deleting_the_only_exchange_stays_in_the_chat_view(self):
+        """A new chat page, not a different part of the plugin."""
+        pairs = self._session_with(1)
+        self._delete(pairs[0])
+        self.assertEqual(self.shell.current_view(), "chat")
+
+    # ── several exchanges: deleting one changes nothing else ─────────────────
+    def test_deleting_one_of_two_keeps_the_session(self):
+        pairs = self._session_with(2)
+        self._delete(pairs[0])
+        self.assertEqual(self.page.current_chat_id, "sess-1")
+
+    def test_deleting_one_of_two_leaves_the_other_on_screen(self):
+        pairs = self._session_with(2)
+        self._delete(pairs[0])
+        remaining = sorted(b.message_id for b in self.page._bubbles)
+        self.assertEqual(remaining, [102, 103])
+        self.assertIsNone(self.page._empty_state,
+                          "the empty state appeared over a live conversation")
+
+    def test_both_halves_of_the_turn_go(self):
+        """Deleting the reply takes the prompt, and the other way round."""
+        pairs = self._session_with(2)
+        self._delete(pairs[1])
+        remaining = sorted(b.message_id for b in self.page._bubbles)
+        self.assertEqual(remaining, [100, 101])
+
+    # ── what counts as "still has chats" ────────────────────────────────────
+    def test_a_leftover_error_card_does_not_count_as_a_conversation(self):
+        """An error notice is not a chat.
+
+        One left over from a failed turn would otherwise make an emptied
+        session look like it still had something in it, and the user would
+        be stranded on a dead session showing only an error.
+        """
+        pairs = self._session_with(1)
+        self.page._add_system_message("**Could not do that**", tone="error")
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self._delete(pairs[0])
+        self.assertIsNone(self.page.current_chat_id)
+        self.assertIsNotNone(self.page._empty_state)
+
+    def test_a_just_sent_message_counts_even_without_an_id(self):
+        """It has no server id yet, but it is on screen and it is a chat."""
+        pairs = self._session_with(1)
+        self.page.add_message("just typed", is_user=True)   # no message_id
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self._delete(pairs[0])
+        self.assertEqual(self.page.current_chat_id, "sess-1",
+                         "threw away a session that still had a message")
+
+    def test_the_history_list_is_told_either_way(self):
+        for exchanges in (1, 2):
+            pairs = self._session_with(exchanges)
+            seen = []
+            self.page.history_changed.connect(lambda: seen.append(True))
+            try:
+                self._delete(pairs[0])
+                self.assertTrue(seen, f"{exchanges} exchange(s): "
+                                      f"history was not refreshed")
+            finally:
+                self.page.history_changed.disconnect()
+
+
+class DrawBarFootprintTest(unittest.TestCase):
+    """The on-canvas draw controls: one row, movable, parked where you left it.
+
+    This was a 280x300 card that could not be moved — measured, 9% of the
+    AREA of a 1280x720 canvas and 42% of its HEIGHT, sitting on top of the
+    imagery being traced. The numbers below are the point of the change, so
+    they are asserted rather than left to a screenshot.
+    """
+
+    # Generous enough not to be brittle about font metrics, tight enough to
+    # fail if the strip ever grows a second row or its labels back.
+    MAX_HEIGHT = 56
+    MAX_AREA_PCT = 3.0
+
+    def setUp(self):
+        from rasid_components.geometry.modern_draw_tool import DrawingToolbar
+        self._saved = prefs.get_str(prefs.DRAW_BAR_POS)
+        prefs.set_value(prefs.DRAW_BAR_POS, "")
+        self.bar = DrawingToolbar()
+        self.bar.show()
+        for _ in range(20):
+            QGIS_APP.processEvents()
+
+    def tearDown(self):
+        self.bar.cleanup()
+        _destroy(self.bar)
+        self.bar = None
+        prefs.set_value(prefs.DRAW_BAR_POS, self._saved or "")
+
+    def test_it_is_a_single_row(self):
+        self.bar.update_info(4, "12.4 km²", "14.1 km")
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.assertLessEqual(
+            self.bar.height(), self.MAX_HEIGHT,
+            f"the strip is {self.bar.height()}px tall; it has grown a row")
+
+    def test_it_covers_little_of_the_map(self):
+        self.bar.update_info(4, "12.4 km²", "14.1 km")
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        pct = (self.bar.width() * self.bar.height()) / (1280.0 * 720.0) * 100
+        self.assertLess(
+            pct, self.MAX_AREA_PCT,
+            f"covers {pct:.1f}% of a 1280x720 canvas "
+            f"({self.bar.width()}x{self.bar.height()})")
+
+    def test_the_measurements_read_on_one_line(self):
+        self.bar.update_info(4, "12.4 km²", "14.1 km")
+        text = self.bar.info_label.text()
+        self.assertNotIn("\n", text, text)
+        self.assertIn("12.4 km²", text)
+        self.assertIn("14.1 km", text)
+        self.assertFalse(self.bar.info_label.wordWrap(),
+                         "word wrap is what let this grow to three lines")
+
+    def test_only_the_primary_action_keeps_a_label(self):
+        self.assertTrue(self.bar.finish_btn.text().strip())
+        for name in ("undo_btn", "clear_btn", "cancel_btn"):
+            button = getattr(self.bar, name)
+            self.assertEqual(button.text(), "", name)
+
+    def test_every_icon_only_button_says_what_it_does_and_its_key(self):
+        """The tooltips carry what the removed hint line used to say."""
+        expected = {"undo_btn": "Backspace", "cancel_btn": "Esc"}
+        for name in ("undo_btn", "clear_btn", "cancel_btn"):
+            tip = getattr(self.bar, name).toolTip()
+            self.assertTrue(tip.strip(), f"{name} has no tooltip")
+            if name in expected:
+                self.assertIn(expected[name], tip, name)
+
+    def test_the_three_glyphs_are_different_shapes(self):
+        """Rendered at 14px, `undo` and `refresh` are one arc at two
+        rotations — with the labels gone the glyph is all there is to tell
+        these apart, so `clear` uses a bin instead."""
+        names = {self.bar.undo_btn._icon_name,
+                 self.bar.clear_btn._icon_name,
+                 self.bar.cancel_btn._icon_name}
+        self.assertEqual(len(names), 3, names)
+        self.assertNotIn("refresh", names)
+
+    def test_it_is_draggable(self):
+        from rasid_components.window_drag import WindowDragFilter
+        self.assertIsInstance(self.bar._drag, WindowDragFilter)
+        self.assertTrue(self.bar._drag.is_enabled())
+
+    def test_the_parked_position_survives_the_bar(self):
+        self.bar.move(321, 234)
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.bar.remember_position()
+        self.assertEqual(prefs.get_str(prefs.DRAW_BAR_POS), "321,234")
+
+    def test_hiding_remembers_where_it_was(self):
+        """Hiding is common to finish, cancel and the tool being torn down."""
+        self.bar.move(275, 180)
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.bar.hide()
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.assertEqual(prefs.get_str(prefs.DRAW_BAR_POS), "275,180")
+
+    def test_an_offscreen_memory_is_discarded(self):
+        """A position from a monitor that has since been unplugged.
+
+        Restoring it would park the bar where it cannot be reached or
+        dragged back, with no way to recover but editing QSettings.
+        """
+        prefs.set_value(prefs.DRAW_BAR_POS, "-9000,-9000")
+        self.assertIsNone(self.bar.remembered_position())
+
+    def test_a_corrupt_memory_is_discarded(self):
+        for value in ("garbage", "12", "a,b", "12,", ""):
+            prefs.set_value(prefs.DRAW_BAR_POS, value)
+            self.assertIsNone(self.bar.remembered_position(), value)
+
+    def test_a_reachable_memory_is_restored(self):
+        screen = QGIS_APP.primaryScreen().availableGeometry()
+        point = screen.topLeft() + QPoint(60, 60)
+        prefs.set_value(prefs.DRAW_BAR_POS, f"{point.x()},{point.y()}")
+        self.assertEqual(self.bar.remembered_position(), point)
+
+
+class NavOrderTest(unittest.TestCase):
+    """Chat history belongs directly under New chat."""
+
+    def test_history_follows_new_chat(self):
+        from rasid_components.nav_rail import NAV_ITEMS
+        keys = [key for key, _icon, _tip in NAV_ITEMS]
+        self.assertEqual(keys[:2], ["new-chat", "history"],
+                         f"the rail starts {keys[:3]}")
+
+    def test_projects_and_gobox_no_longer_split_them(self):
+        from rasid_components.nav_rail import NAV_ITEMS
+        keys = [key for key, _icon, _tip in NAV_ITEMS]
+        self.assertGreater(keys.index("projects"), keys.index("history"))
+        self.assertGreater(keys.index("gobox"), keys.index("history"))
+
+
+class DeletingAChatFromHistoryTest(unittest.TestCase):
+    """Where a delete leaves the user depends on what is left behind.
+
+    With other conversations still listed there is more to manage, so the
+    view stays on History. With none left there is nothing to manage and an
+    empty list is a dead end, so that case goes on to a new chat.
+
+    Either way the chat page must stop pointing at a deleted conversation, or
+    the composer would post the next message to a session the server no
+    longer has — but that is a reset, not necessarily a navigation.
+    """
+
+    def setUp(self):
+        self.shell = GoPilotShell(None)
+        self.shell.resize(470, 760)
+        self.shell.show()
+        for _ in range(15):
+            QGIS_APP.processEvents()
+
+    def tearDown(self):
+        _destroy(self.shell)
+        self.shell = None
+
+    def _seed(self, ids, open_id=None):
+        """Put ``ids`` in the history list, with ``open_id`` the live chat."""
+        self.shell.show_view("history")
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        history = self.shell.history_page
+        history._all_chats = [{"id": i, "title": f"Chat {i}"} for i in ids]
+        history._current_id = str(open_id) if open_id is not None else None
+        self.shell.chat_page.current_chat_id = (
+            str(open_id) if open_id is not None else None)
+        history._render()
+        for _ in range(10):
+            QGIS_APP.processEvents()
+
+    def _delete(self, chat_id):
+        self.shell.history_page._on_deleted(chat_id)
+        for _ in range(12):
+            QGIS_APP.processEvents()
+
+    def test_with_others_left_the_view_stays_on_history(self):
+        self._seed(["77", "78", "79"], open_id="77")
+        self._delete("77")
+        self.assertEqual(self.shell.current_view(), "history",
+                         "deleting one of several threw the user out")
+
+    def test_with_others_left_the_chat_page_is_still_reset(self):
+        """Otherwise the next message posts to a deleted session."""
+        self._seed(["77", "78", "79"], open_id="77")
+        self._delete("77")
+        self.assertIsNone(self.shell.chat_page.current_chat_id)
+
+    def test_deleting_the_last_chat_goes_on_to_a_new_one(self):
+        """An empty History has nothing left to manage."""
+        self._seed(["77"], open_id="77")
+        self._delete("77")
+        self.assertEqual(self.shell.current_view(), "chat")
+        self.assertIsNone(self.shell.chat_page.current_chat_id)
+
+    def test_deleting_the_last_chat_navigates_even_if_it_was_not_open(self):
+        """The rule is about what is LEFT, not about which one went."""
+        self._seed(["77"], open_id=None)
+        self._delete("77")
+        self.assertEqual(self.shell.current_view(), "chat")
+
+    def test_deleting_some_other_chat_touches_neither(self):
+        self._seed(["77", "78"], open_id="77")
+        self._delete("78")
+        self.assertEqual(self.shell.current_view(), "history")
+        self.assertEqual(self.shell.chat_page.current_chat_id, "77")
+
+    def test_the_open_chat_stays_selected_when_another_is_deleted(self):
+        self._seed(["77", "78"], open_id="77")
+        self._delete("78")
+        self.assertEqual(self.shell.history_page._current_id, "77")
+
+    def test_the_new_chat_signal_still_navigates(self):
+        """The two signals mean different things and must stay apart."""
+        self.shell.show_view("history")
+        self.shell.history_page.new_chat_requested.emit()
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.assertEqual(self.shell.current_view(), "chat")
+
+
+class PlanCardTest(unittest.TestCase):
+    """What the account is entitled to, and what each absence means.
+
+    Every figure from `/billing/me/` is optional, and none of the absences
+    mean zero: a null wallet is an account from before billing, an absent
+    storage block is an older watcher, a null subscription is no paid plan.
+    Showing zeros for any of them would be the same bug that once told every
+    user they held 0 tokens.
+    """
+
+    FULL = {
+        "plan_code": "pro", "plan_name": "Pro",
+        "gotokens": {"balance": "2404153.0000",
+                     "monthly_allowance": "5000000.0000",
+                     "period_end": "2026-12-01", "is_overdrawn": False},
+        "storage": {"used_bytes": 1288490188, "limit_bytes": 107374182400,
+                    "unlimited": False, "over": False, "fraction": 0.012},
+        "subscription": {"status": "active",
+                         "current_period_end": "2026-12-01T00:00:00Z",
+                         "cancel_at_period_end": False},
+    }
+
+    def setUp(self):
+        from rasid_components.settings_page import SettingsPage
+        self.page = SettingsPage(client=None)
+        self.page.resize(460, 900)
+        self.page.show()
+        for _ in range(12):
+            QGIS_APP.processEvents()
+
+    def tearDown(self):
+        _destroy(self.page)
+        self.page = None
+
+    def _apply(self, entitlements, error=None):
+        self.page.set_profile({"profile": {"email": "a@b.c"},
+                               "entitlements": entitlements,
+                               "entitlements_error": error})
+        for _ in range(12):
+            QGIS_APP.processEvents()
+
+    def test_a_full_plan_shows_tokens_storage_and_the_renewal(self):
+        self._apply(self.FULL)
+        self.assertTrue(self.page._plan_card.isVisible())
+        self.assertEqual(self.page._plan_name.text(), "Pro")
+        self.assertEqual(self.page._plan_renewal.text(), "Renews 1 Dec 2026")
+        self.assertIn("2,404,153", self.page._tokens_caption.text())
+        self.assertIn("5,000,000", self.page._tokens_caption.text())
+        self.assertIn("100 GB", self.page._storage_caption.text())
+        self.assertTrue(self.page._tokens_meter.isVisible())
+        self.assertTrue(self.page._storage_meter.isVisible())
+
+    def test_a_cancelling_subscription_ends_rather_than_renews(self):
+        """Not a renewal date at all — the opposite — so not that word."""
+        payload = dict(self.FULL)
+        payload["subscription"] = dict(self.FULL["subscription"],
+                                       cancel_at_period_end=True)
+        self._apply(payload)
+        self.assertEqual(self.page._plan_renewal.text(), "Ends 1 Dec 2026")
+
+    def test_unlimited_storage_draws_no_bar(self):
+        """A full bar and no limit at all must not look alike."""
+        payload = dict(self.FULL)
+        payload["storage"] = {"used_bytes": 1288490188, "limit_bytes": 0,
+                              "unlimited": True, "over": False,
+                              "fraction": None}
+        self._apply(payload)
+        self.assertIn("unlimited", self.page._storage_caption.text())
+        self.assertFalse(self.page._storage_meter.isVisible())
+
+    def test_being_over_the_limit_is_coloured_differently(self):
+        payload = dict(self.FULL)
+        payload["storage"] = dict(self.FULL["storage"], over=True,
+                                  used_bytes=112000000000, fraction=1.04)
+        self._apply(payload)
+        self.assertIn(design.Tokens(design.is_dark()).error,
+                      self.page._storage_meter.styleSheet())
+
+    def test_a_null_wallet_hides_the_token_row_rather_than_showing_zero(self):
+        payload = {"plan_code": "free", "plan_name": "Free",
+                   "gotokens": None, "subscription": None}
+        self._apply(payload)
+        self.assertTrue(self.page._plan_card.isVisible())
+        self.assertEqual(self.page._plan_name.text(), "Free")
+        self.assertFalse(self.page._tokens_caption.isVisible())
+        self.assertFalse(self.page._tokens_meter.isVisible())
+
+    def test_an_absent_storage_block_hides_the_storage_row(self):
+        payload = {k: v for k, v in self.FULL.items() if k != "storage"}
+        self._apply(payload)
+        self.assertFalse(self.page._storage_caption.isVisible())
+        self.assertFalse(self.page._storage_meter.isVisible())
+
+    def test_a_failed_request_hides_the_whole_card(self):
+        self._apply(None, error="503 Service Unavailable")
+        self.assertFalse(self.page._plan_card.isVisible())
+
+    def test_an_unparseable_date_is_dropped_not_printed_raw(self):
+        """"Renews 2026-13-99" is worse than no renewal line."""
+        payload = dict(self.FULL)
+        payload["subscription"] = dict(self.FULL["subscription"],
+                                       current_period_end="not a date")
+        payload["gotokens"] = dict(self.FULL["gotokens"], period_end=None)
+        self._apply(payload)
+        self.assertEqual(self.page._plan_renewal.text(), "")
+        self.assertFalse(self.page._plan_renewal.isVisible())
+
+    def test_the_wallet_period_is_used_when_there_is_no_subscription(self):
+        """A comped account still has an allowance that rolls over."""
+        payload = dict(self.FULL)
+        payload["subscription"] = None
+        self._apply(payload)
+        self.assertEqual(self.page._plan_renewal.text(),
+                         "Allowance resets 1 Dec 2026")
+
+    def test_the_version_is_not_hardcoded(self):
+        """settings_page carried its own "2.0.0" beside the feedback one."""
+        import inspect
+        from rasid_components import settings_page
+        source = inspect.getsource(settings_page)
+        self.assertNotIn('PLUGIN_VERSION = "2.0.0"', source)
+
+
+class AiDisclaimerTest(unittest.TestCase):
+    """The AI notice under the composer, worded as the SaaS words it."""
+
+    SENTENCE = (
+        "GoPilot is powered by AI. By using it, you agree to our Terms of "
+        "Service and Privacy Policy. Conversations may be reviewed for "
+        "quality and safety, but are never used to train our AI models."
+    )
+
+    def setUp(self):
+        from rasid_components.gopilot_page import GoPilotPage
+        self.page = GoPilotPage(None, None)
+        self.page.resize(design.DOCK_DEFAULT_WIDTH, 820)
+        self.page.show()
+        for _ in range(12):
+            QGIS_APP.processEvents()
+
+    def tearDown(self):
+        _destroy(self.page)
+        self.page = None
+
+    def _plain(self):
+        """The label's text with the anchor markup stripped back out."""
+        import re
+        html = self.page._disclaimer_label.text()
+        return re.sub(r"<[^>]+>", "", html)
+
+    def test_the_wording_is_exact(self):
+        self.assertEqual(self._plain(), self.SENTENCE)
+
+    def test_it_is_visible_on_an_empty_chat_and_a_full_one(self):
+        """A standing statement about the product, not an onboarding note."""
+        self.page.start_new_chat()
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.assertTrue(self.page._disclaimer_label.isVisible())
+        self.page.add_message("hello", is_user=True, message_id=1)
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.assertTrue(self.page._disclaimer_label.isVisible())
+
+    def test_both_documents_are_reachable(self):
+        """Naming documents a reader cannot open would be a dead end."""
+        html = self.page._disclaimer_label.text()
+        self.assertIn("/terms", html)
+        self.assertIn("/privacy-policy", html)
+        self.assertTrue(self.page._disclaimer_label.openExternalLinks())
+
+    def test_it_sits_below_the_composer(self):
+        host = self.page._disclaimer_label.parent()
+        self.assertGreater(host.y(), self.page.composer.y(),
+                           "the disclaimer is above the composer")
+
+
+class MessageFooterOutsideBubbleTest(unittest.TestCase):
+    """The timestamp and trash sit below the bubble, not inside its fill.
+
+    Structural, not cosmetic. Inside the user's brand-green fill no red glyph
+    can clear the 3:1 WCAG floor for a non-text graphic, because red and green
+    sit at nearly the same luminance — it measured 1.14:1. Three in-bubble
+    fixes were tried and rejected before the footer was moved out onto the
+    panel background, which is one surface for both roles.
+    """
+
+    def setUp(self):
+        from rasid_components.gopilot_page import GoPilotPage
+        self.page = GoPilotPage(None, None)
+        self.page.resize(470, 760)
+        self.page.show()
+        for _ in range(15):
+            QGIS_APP.processEvents()
+        self.page.start_new_chat()
+        for _ in range(15):
+            QGIS_APP.processEvents()
+        self.page._remove_empty_state()
+        self.page.add_message("a question", is_user=True, message_id=11)
+        self.page.add_message("an answer", is_user=False, message_id=12)
+        for _ in range(20):
+            QGIS_APP.processEvents()
+
+    def tearDown(self):
+        _destroy(self.page)
+        self.page = None
+
+    def test_the_trash_is_below_the_styled_frame_on_both_roles(self):
+        for bubble in self.page._bubbles:
+            frame_bottom = bubble._frame.mapTo(
+                bubble, bubble._frame.rect().bottomLeft()).y()
+            self.assertGreaterEqual(
+                bubble._trash_button.y(), frame_bottom,
+                f"{bubble.role}: the trash is still inside the bubble fill")
+
+    def test_the_container_itself_paints_nothing(self):
+        """Only the inner frame carries the fill, or the footer sits on it."""
+        for bubble in self.page._bubbles:
+            self.assertNotIn("QFrame#bubble", bubble.styleSheet())
+            self.assertIn("QFrame#bubble", bubble._frame.styleSheet())
+
+    def test_the_red_clears_the_contrast_floor_where_it_now_sits(self):
+        """3:1 is the WCAG floor for a non-text graphic."""
+        def luminance(colour):
+            channels = []
+            for value in (colour.redF(), colour.greenF(), colour.blueF()):
+                channels.append(value / 12.92 if value <= 0.03928
+                                else ((value + 0.055) / 1.055) ** 2.4)
+            return (0.2126 * channels[0] + 0.7152 * channels[1]
+                    + 0.0722 * channels[2])
+
+        for dark in (False, True):
+            tokens = design.Tokens(dark)
+            first = luminance(QColor(tokens.error))
+            second = luminance(QColor(tokens.canvas))
+            lighter, darker = max(first, second), min(first, second)
+            value = (lighter + 0.05) / (darker + 0.05)
+            self.assertGreaterEqual(
+                value, 3.0,
+                f"trash on the panel background is {value:.2f}:1 on "
+                f"{'dark' if dark else 'light'}")
+
+    def test_both_roles_share_one_control(self):
+        tones = {b._trash_button._tone for b in self.page._bubbles}
+        self.assertEqual(tones, {"danger"})
+
+    def test_the_timestamp_is_not_the_bubble_foreground(self):
+        """On the panel background, white-on-green would be white-on-white."""
+        for bubble in self.page._bubbles:
+            label = bubble._time_label
+            if label is None:
+                continue
+            self.assertNotIn(bubble._fg.upper(), label.styleSheet().upper(),
+                             f"{bubble.role}: timestamp kept the bubble's fg")
+
+
 class DialogFooterTest(unittest.TestCase):
     """One convention for every dialog footer in the plugin.
 
@@ -3895,18 +5956,22 @@ class MessageDeleteTest(unittest.TestCase):
                 f"ai trash is {value:.2f}:1 on "
                 f"{'dark' if dark else 'light'}")
 
-    def test_the_known_contrast_cost_is_recorded(self):
+    def test_why_the_footer_is_outside_the_bubble_is_recorded(self):
         """The decision has to be findable, not just made.
 
-        Asserted so the next person who measures 1.14:1 finds the reasoning
-        and the two rejected alternatives, instead of silently reinstating a
-        disc the design deliberately dropped.
+        This used to assert that the ACCEPTED COST of an unreadable red was
+        written down ("1.14:1", "red-green"). There is no longer a cost to
+        accept: the footer moved onto the panel background and the same red
+        now measures 3.26:1. What has to stay findable is why the structure
+        is the way it is, so that nobody tidies the footer back inside the
+        bubble and silently reintroduces 1.14:1.
         """
         import inspect
         from rasid_components.message_bubble import MessageBubble
         source = inspect.getsource(MessageBubble.__init__)
-        self.assertIn("1.14:1", source)
-        self.assertIn("red-green", source)
+        self.assertIn("1.14:1", source)          # what it was
+        self.assertIn("3.26:1", source)          # what it is
+        self.assertIn("OUTSIDE THE BUBBLE", source)
 
     def test_the_bubble_asks_the_page_rather_than_the_api(self):
         """Deleting removes the sibling too, which only the page knows about."""
@@ -4364,6 +6429,10 @@ class DrawToolDesignTest(unittest.TestCase):
             self.assertTrue(bar.finish_btn.isEnabled())
             self.assertTrue(bar.undo_btn.isEnabled())
         finally:
+            # cleanup() first: the bar installs a Python event filter to be
+            # draggable, and one left on a widget being destroyed is what
+            # kills the interpreter at shutdown with no traceback.
+            bar.cleanup()
             _destroy(bar)
 
     def test_the_undo_glyph_exists(self):

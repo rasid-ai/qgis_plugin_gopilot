@@ -56,7 +56,10 @@ from .compat import (
     Qt_SmoothTransformation, exec_dialog,
     Qt_AlignTop,
     Qt_ScrollBarAlwaysOff,
+    is_alive,
 )
+from .downloads import DownloadButton
+from .layer_style import apply_sld
 from .logger import debug_print
 
 # Extensions GoPilot can hand back and QGIS can open.
@@ -82,13 +85,23 @@ except AttributeError:  # pragma: no cover - very old bindings
 
 
 # ── layer loading ────────────────────────────────────────────────────────────
-def add_layer_to_qgis(filepath, layer_name, iface=None):
+def _file_id_in(url):
+    """The ``<id>`` from ``/files/<id>/download/``, as a string, or None."""
+    match = re.search(r"/files/(\d+)/", url or "")
+    return match.group(1) if match else None
+
+
+def add_layer_to_qgis(filepath, layer_name, iface=None, sld=None):
     """Add ``filepath`` to the current project, honouring the user's settings.
 
     Grouping and zoom are preferences rather than hardcoded behaviour because
     this writes into the user's own QGIS document: some people want every
     result corralled under one group node, others want layers to land where
     they land. See :mod:`prefs`.
+
+    ``sld`` is the style the API sent with this file, applied before the layer
+    goes into the project so it is never briefly visible in QGIS's default
+    random colour. Optional: a file with no style loads exactly as before.
     """
     from qgis.core import QgsProject, QgsRasterLayer, QgsVectorLayer
 
@@ -100,6 +113,10 @@ def add_layer_to_qgis(filepath, layer_name, iface=None):
 
     if not layer.isValid():
         raise RuntimeError(f"QGIS could not open {os.path.basename(filepath)}")
+
+    # Before the layer joins the project, so it is never drawn once in QGIS's
+    # default colours and then again in the right ones.
+    apply_sld(layer, sld)
 
     project = QgsProject.instance()
 
@@ -553,8 +570,14 @@ class MessageBubble(QFrame):
 
     def __init__(self, text, role="ai", timestamp=None, client=None,
                  iface=None, with_time=True, attachments=None, tone="neutral",
-                 message_id=None, parent=None):
+                 message_id=None, files=None, parent=None):
         super().__init__(parent)
+        # The API's own list of this message's files. The result controls are
+        # found by reading the message TEXT for links, which yields a URL and
+        # a filename and nothing else — so the style, the file type and the
+        # file id all live here instead. Without it a layer could be
+        # downloaded but never styled, which is what this field is for.
+        self.set_files(files)
         self.role = role
         self.client = client
         self.iface = iface
@@ -563,7 +586,18 @@ class MessageBubble(QFrame):
         # arrives, since there is nothing to ask the server to delete.
         self.message_id = message_id
         self._download_threads = []
+        self._downloads = []
+        # Result URLs auto-load has already fired for. Kept on the BUBBLE,
+        # not on the controllers: `set_content` rebuilds the controllers on
+        # every poll of a streaming reply, so per-controller state resets
+        # and auto-load would add the same layer once per poll.
+        self._auto_loaded = set()
         self._network_managers = []
+        self._replies = []
+        # Set by cleanup(). Every asynchronous callback on this bubble checks
+        # it before touching a widget, because the work it was waiting on can
+        # finish after the transcript that owned it has gone.
+        self._closing = False
         self._max_width = 420
 
         t = design.tokens()
@@ -583,16 +617,28 @@ class MessageBubble(QFrame):
             bg, fg, border = t.bubble_ai, t.bubble_ai_text, t.bubble_ai_border
         self._fg = fg
 
-        self.setObjectName("bubble")
-        self.setFrameShape(QFrame_StyledPanel)
-        self.setStyleSheet(f"""
+        # THIS widget is a transparent container; the visible bubble is the
+        # frame inside it. The split exists so the footer (timestamp and
+        # trash) can sit BELOW the bubble on the panel background instead of
+        # inside the fill — which is where the SaaS puts it, and which is what
+        # makes the trash legible: see the footer block further down.
+        paint_transparent(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+
+        self._frame = QFrame()
+        self._frame.setObjectName("bubble")
+        self._frame.setFrameShape(QFrame_StyledPanel)
+        self._frame.setStyleSheet(f"""
             QFrame#bubble {{
                 background: {bg}; border: 1px solid {border};
                 border-radius: {design.RADIUS_LG}px;
             }}
         """)
+        outer.addWidget(self._frame)
 
-        lay = QVBoxLayout(self)
+        lay = QVBoxLayout(self._frame)
         lay.setContentsMargins(12, 9, 12, 8)
         lay.setSpacing(3)
 
@@ -660,34 +706,40 @@ class MessageBubble(QFrame):
                 shown = (timestamp
                          or QDateTime.currentDateTime().toString("HH:mm"))
                 self._time_label = QLabel(shown)
+                # text_muted, not the bubble's `fg`. The footer now sits on
+                # the panel background, where the user bubble's white-on-green
+                # foreground would have been white on near-white.
                 self._time_label.setStyleSheet(
-                    f"color:{fg}; font-family:{design.FONT_STACK}; "
+                    f"color:{t.text_muted}; font-family:{design.FONT_STACK}; "
                     f"font-size:{design.TEXT_XS}px; background:transparent; "
                     f"border:none;"
                 )
                 footer.addWidget(self._time_label)
 
-            # The SAME control on every bubble: one red, no backing shape,
-            # whichever surface it sits on. Red at rest rather than only on
-            # hover — in the history list a permanent red would make the whole
-            # column read as warnings, but a transcript has at most two of
-            # these per exchange and the muted grey was genuinely hard to find.
+            # The SAME control on every bubble: one red, no backing shape.
+            # Red at rest rather than only on hover — in the history list a
+            # permanent red would make the whole column read as warnings, but
+            # a transcript has at most two of these per exchange and a muted
+            # grey was genuinely hard to find.
             #
-            # A NOTE FOR ANYONE ABOUT TO "FIX" THE CONTRAST
-            # =============================================
-            # On the user's brand-green bubble this red measures 1.14:1 against
-            # its background, well under the 3:1 WCAG floor for a non-text
-            # graphic — red and green sit at almost the same luminance, so no
-            # red glyph is legible there by that metric. Two alternatives were
-            # built and rejected: a pale pink glyph (3.20:1, but it reads as
-            # WHITE at 11px), and a red glyph on a light disc (3.29:1 on the
-            # disc, 3.75:1 disc-on-green, but it made the control a different
-            # component from the one on the assistant bubble).
+            # WHY THE FOOTER IS OUTSIDE THE BUBBLE
+            # ====================================
+            # Inside the user's brand-green fill this red measured 1.14:1 in
+            # light mode and 1.41:1 in dark, far under the 3:1 WCAG floor for
+            # a non-text graphic: red and green sit at nearly the same
+            # luminance, so NO red glyph can be legible there. Three fixes
+            # were tried and rejected inside the bubble — a muted grey glyph
+            # (1.67:1), a pale pink one (3.20:1, but it reads as white at
+            # 11px), and a red glyph on a light disc (which made the control a
+            # different component from the assistant bubble's).
             #
-            # Matching the two bubbles was chosen deliberately over the
-            # measurement. The glyph is still told apart by HUE, which is what
-            # a 3:1 luminance rule does not capture — but it will be hard for
-            # anyone with a red-green deficiency, and that is the known cost.
+            # The fix was structural, not chromatic: the footer moved OUT of
+            # the fill and onto the panel background, which is the same
+            # surface for both roles. The identical red now measures 3.26:1 in
+            # light and 4.96:1 in dark, and the two bubbles share one control
+            # by construction rather than by matching two sets of colours.
+            # It is also where the SaaS has always put it — the timestamp and
+            # trash are a sibling of the bubble there, not children of it.
             self._trash_button = IconButton(
                 "trash", size=20, icon_size=11, tooltip="Delete this exchange",
                 tone="danger", hover_tone="danger")
@@ -702,13 +754,49 @@ class MessageBubble(QFrame):
             else:
                 footer.addWidget(self._trash_button)
                 footer.addStretch()
-            lay.addLayout(footer)
+            # `outer`, not `lay`: below the bubble, not inside it.
+            outer.addLayout(footer)
 
         self.set_content(text)
 
     def _on_trash_clicked(self):
         if self.message_id is not None:
             self.delete_requested.emit(int(self.message_id))
+
+    def raw_text(self):
+        """The markdown this bubble was given, before rendering."""
+        return getattr(self, "_raw_text", "")
+
+    def set_files(self, files):
+        """Attach the API's file list for this message.
+
+        Called again when a streamed reply finishes, because the bubble is
+        opened before the task has reported any files at all.
+        """
+        self._files = [f for f in (files or ()) if isinstance(f, dict)]
+
+    def style_for(self, url):
+        """The SLD the API sent for the file at ``url``, or None.
+
+        Matched on the file id in a download URL first, then on the URL
+        itself. The id is the reliable half: GoPilot rewrites result links to
+        ``/api/llm/files/<id>/download/``, while ``file_url`` can be a
+        presigned link whose query string differs from the one in the text.
+        """
+        if not url or not self._files:
+            return None
+
+        identifier = _file_id_in(url)
+        for entry in self._files:
+            if identifier is not None and str(entry.get("id")) == identifier:
+                return entry.get("sld")
+
+        bare = url.split("?", 1)[0]
+        for entry in self._files:
+            candidate = entry.get("file_url") or ""
+            if candidate and candidate.split("?", 1)[0] == bare:
+                return entry.get("sld")
+        return None
 
     def set_message_id(self, message_id):
         """Attach a server row to this bubble, revealing the trash control.
@@ -720,6 +808,75 @@ class MessageBubble(QFrame):
         self.message_id = message_id
         if self._trash_button is not None:
             self._trash_button.setVisible(message_id is not None)
+
+    # ── teardown ──────────────────────────────────────────────────────────────
+    def cleanup(self):
+        """Stop everything in flight BEFORE this bubble is deleted.
+
+        A bubble can own two kinds of pending work: image-preview requests
+        (``QNetworkReply``) and layer downloads (``DownloadLayerThread``).
+        Both call back into widgets that belong to it, and neither was ever
+        stopped — the bubble was simply ``deleteLater``'d and whatever was
+        running kept running. When a reply then completed, its slot wrote to a
+        freed QLabel and Windows raised an access violation, which is a crash
+        with no Python traceback.
+
+        Order matters: disconnect first, so the abort below cannot deliver a
+        ``finished`` into a half-destroyed object graph, THEN abort.
+
+        Safe to call more than once, and safe to call on a bubble that never
+        started any work.
+        """
+        self._closing = True
+
+        for reply in self._replies:
+            if not is_alive(reply):
+                continue
+            try:
+                reply.finished.disconnect()
+            except (TypeError, RuntimeError):
+                pass            # nothing was connected, or it is already gone
+            try:
+                reply.abort()
+                reply.deleteLater()
+            except RuntimeError:
+                pass
+        self._replies = []
+
+        for manager in self._network_managers:
+            if is_alive(manager):
+                try:
+                    manager.deleteLater()
+                except RuntimeError:
+                    pass
+        self._network_managers = []
+
+        for controller in self._downloads:
+            try:
+                controller.cleanup()
+            except RuntimeError:
+                pass
+        self._downloads = []
+
+        for thread in self._download_threads:
+            try:
+                thread.finished.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                thread.error.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                if thread.isRunning():
+                    thread.requestInterruption()
+                    thread.quit()
+                    # Bounded: a download blocked on a socket must not hang
+                    # the UI thread while a chat is being switched.
+                    thread.wait(2000)
+            except RuntimeError:
+                pass
+        self._download_threads = []
 
     # ── sizing ────────────────────────────────────────────────────────────────
     def set_max_width(self, width):
@@ -943,6 +1100,18 @@ class MessageBubble(QFrame):
     # ── content ───────────────────────────────────────────────────────────────
     def set_content(self, text):
         """Replace the body. Safe to call repeatedly while streaming."""
+        # The result controls are rebuilt from scratch below, so the
+        # controllers driving the old buttons have to go with them —
+        # otherwise each poll of a streaming reply leaves another one behind,
+        # still connected to the project's layersRemoved signal and holding a
+        # button whose C++ side has been deleted.
+        for controller in getattr(self, "_downloads", ()):
+            try:
+                controller.cleanup()
+            except RuntimeError:
+                pass
+        self._downloads = []
+
         while self._results_layout.count():
             item = self._results_layout.takeAt(0)
             if item is None:
@@ -953,6 +1122,10 @@ class MessageBubble(QFrame):
                 widget.deleteLater()
 
         text = str(text or "")
+        # Kept so a bubble can be matched back to its server row later. The
+        # body label holds rendered HTML with the file links stripped out, so
+        # it cannot be compared with what the API returns.
+        self._raw_text = text
         files = extract_file_urls(text)
 
         # Strip the links out of the prose — they are re-rendered as controls
@@ -1006,66 +1179,64 @@ class MessageBubble(QFrame):
         """
 
     def _add_layer_result(self, url, filename):
-        t = design.tokens()
-        btn = QPushButton(f"  Add {filename} to QGIS")
+        """The "Add X to QGIS" control for one result layer.
+
+        The button's behaviour lives in :class:`~.downloads.DownloadButton`,
+        which the processes pane uses too — the two had separate copies of
+        this, and both of them disabled the button for good on success, so
+        removing the layer from QGIS left no way to get it back without
+        reopening the pane.
+        """
+        btn = QPushButton()
         btn.setCursor(Qt_PointingHandCursor)
         btn.setAutoDefault(False)
-        btn.setIcon(icons.icon("download", design.ICON_SM, t.accent))
         btn.setIconSize(QSize(design.ICON_SM, design.ICON_SM))
         btn.setStyleSheet(self._result_button_qss())
         btn.setMaximumWidth(max(40, self._max_width - 26))
-        btn.clicked.connect(
-            partial(self._download_and_load, url, filename, btn))
+
+        if not self.client:
+            btn.setText(f"  Add {filename} to QGIS")
+            btn.setEnabled(False)
+            btn.setToolTip("Sign in to download results")
+            self._results_layout.addWidget(btn)
+            return btn
+
+        controller = DownloadButton(
+            btn, self.client, url,
+            add_layer=lambda path, f=filename, u=url: add_layer_to_qgis(
+                path, f.rsplit(".", 1)[0], self.iface, sld=self.style_for(u)),
+            idle_text=f"  Add {filename} to QGIS",
+            busy_text=f"  Downloading {filename}…",
+            done_text=f"  Added {filename}",
+            filename=filename,
+            threads=self._download_threads,
+        )
+        self._downloads.append(controller)
         self._results_layout.addWidget(btn)
         return btn
 
-    def _download_and_load(self, url, filename, button):
-        if not self.client:
-            QMessageBox.warning(self, "Not signed in",
-                                "Cannot download without an active session.")
-            return
-        button.setText(f"  Downloading {filename}…")
-        button.setEnabled(False)
-
-        thread = DownloadLayerThread(self.client, url, filename)
-        thread.finished.connect(
-            lambda path: self._on_layer_downloaded(path, filename, button))
-        thread.error.connect(
-            lambda msg: self._on_download_error(msg, button, filename))
-        self._download_threads.append(thread)
-        thread.start()
-
-    def _on_layer_downloaded(self, filepath, filename, button):
-        t = design.tokens()
-        try:
-            add_layer_to_qgis(filepath, filename.rsplit('.', 1)[0], self.iface)
-        except Exception as exc:
-            QMessageBox.warning(self, "Could not load layer",
-                                f"The file downloaded but QGIS could not open "
-                                f"it:\n{exc}")
-            button.setText(f"  Retry {filename}")
-            button.setEnabled(True)
-            return
-        button.setText(f"  Added {filename}")
-        button.setIcon(icons.icon("check", design.ICON_SM, t.success))
-        button.setEnabled(False)
-
-    def _on_download_error(self, message, button, filename):
-        box = QMessageBox(self)
-        box.setWindowTitle("Download failed")
-        box.setIcon(QMessageBox_Warning)
-        box.setText(f"Could not download {filename}:\n{message}")
-        box.setStandardButtons(QMessageBox_Ok)
-        exec_dialog(box)
-        button.setText(f"  Retry {filename}")
-        button.setEnabled(True)
-
     def _auto_load(self):
-        """Honour the "Load results automatically" preference."""
-        for index in range(self._results_layout.count()):
-            widget = self._results_layout.itemAt(index).widget()
-            if isinstance(widget, QPushButton) and widget.isEnabled():
-                widget.click()
+        """Honour the "Load results automatically" preference.
+
+        Driven off the controllers' ``has_run``, not off whether the button
+        happens to be enabled. That used to work only because a loaded
+        button was disabled for good — now that "Added" stays clickable so
+        the user can re-add a layer they removed, clicking every enabled
+        button would add a second copy of everything on each re-render, and
+        ``set_content`` re-renders on every poll of a streaming reply.
+
+        It also deliberately does not fire again once the user has REMOVED a
+        layer: that is a decision they made, not a result waiting to load.
+        """
+        for controller in self._downloads:
+            try:
+                url = controller.url
+                if url in self._auto_loaded:
+                    continue
+                self._auto_loaded.add(url)
+                controller.start()
+            except RuntimeError:
+                continue
 
     # ── result: an image ──────────────────────────────────────────────────────
     def _add_image_result(self, url, filename):
@@ -1127,8 +1298,25 @@ class MessageBubble(QFrame):
             request.setRawHeader(b"Authorization",
                                  f"Bearer {token}".encode("utf-8"))
         reply = manager.get(request)
+        self._replies.append(reply)
 
         def on_finished():
+            # GUARD FIRST, before touching anything C++.
+            #
+            # This closure holds `reply` and `preview`, and `manager` is
+            # parented to the bubble. Clearing the transcript — which opening
+            # a chat from History does twice — deletes the bubble, which
+            # deletes the manager, which aborts this reply and emits
+            # `finished` from inside its own destruction. Reading `preview`
+            # or `reply` at that point is a use-after-free: on Windows an
+            # access violation that takes QGIS down with no traceback, which
+            # is exactly the crash reported on opening a chat that contains an
+            # image result.
+            #
+            # `cleanup()` disconnects this before teardown, so this guard is
+            # the second line of defence rather than the only one.
+            if self._closing or not is_alive(reply) or not is_alive(preview):
+                return
             t = design.tokens()
             try:
                 if reply.error():
@@ -1156,10 +1344,16 @@ class MessageBubble(QFrame):
                     f"background:transparent; border:1px solid {t.border}; "
                     f"border-radius:{design.RADIUS}px; padding:3px;"
                 )
+            except RuntimeError:
+                # The widget went away between the guard and here. Nothing to
+                # report it on, so there is nothing to do.
+                return
             except Exception as exc:
-                preview.setText(f"Preview failed: {exc}")
+                if is_alive(preview):
+                    preview.setText(f"Preview failed: {exc}")
             finally:
-                reply.deleteLater()
+                if is_alive(reply):
+                    reply.deleteLater()
 
         reply.finished.connect(on_finished)
 

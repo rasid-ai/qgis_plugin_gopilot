@@ -44,8 +44,10 @@ from .compat import (
     QMessageBox_No,
     QMessageBox_Yes,
     Qt_AlignCenter, Qt_AlignVCenter, Qt_LeftButton, Qt_PointingHandCursor,
+    Qt_TextBrowserInteraction,
 )
 from .composer import Composer
+from .config import APP_BASE_URL
 from .geometry import GeometryInputManager
 from .logger import debug_print
 from .message_bubble import MessageBubble
@@ -347,9 +349,57 @@ class GoPilotPage(QWidget):
         self.composer.draw_requested.connect(self.start_draw)
         root.addWidget(self.composer)
 
+        root.addWidget(self._build_disclaimer())
+
         self.start_new_chat()
 
     # ── chrome ────────────────────────────────────────────────────────────────
+    def _build_disclaimer(self):
+        """The AI notice under the composer, as the SaaS carries it.
+
+        Permanent rather than dismissible, and not part of the empty state:
+        it is a standing statement about the product, so it has to be there
+        on the hundredth message as well as the first. The SaaS puts it in
+        exactly this spot — a hairline-topped strip below the composer.
+
+        The wording is the SaaS's, verbatim. "Terms of Service" and "Privacy
+        Policy" are links here though they are plain text on the web: in a
+        QGIS panel there is nowhere to navigate to, so naming documents the
+        reader cannot open would be a dead end.
+        """
+        t = design.tokens()
+        host = QFrame()
+        host.setObjectName("aiDisclaimer")
+        host.setStyleSheet(
+            f"QFrame#aiDisclaimer {{ background:{t.surface}; border:none; "
+            f"border-top:{design.BORDER}px solid {t.divider}; }}"
+        )
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(design.SPACE_3, design.SPACE_1,
+                               design.SPACE_3, design.SPACE_1)
+        lay.setSpacing(0)
+
+        link = (f"color:{t.text_secondary}; text-decoration:underline;")
+        label = QLabel(
+            f"GoPilot is powered by AI. By using it, you agree to our "
+            f'<a href="{APP_BASE_URL}/terms" style="{link}">Terms of '
+            f'Service</a> and <a href="{APP_BASE_URL}/privacy-policy" '
+            f'style="{link}">Privacy Policy</a>. Conversations may be '
+            f"reviewed for quality and safety, but are never used to train "
+            f"our AI models."
+        )
+        label.setWordWrap(True)
+        label.setAlignment(Qt_AlignCenter)
+        label.setOpenExternalLinks(True)
+        label.setTextInteractionFlags(Qt_TextBrowserInteraction)
+        label.setStyleSheet(
+            f"background:transparent; border:none; color:{t.text_muted}; "
+            f"font-family:{design.FONT_STACK}; font-size:{design.TEXT_XS}px;"
+        )
+        lay.addWidget(label)
+        self._disclaimer_label = label
+        return host
+
     def _build_status_strip(self):
         """A thin strip that appears only while something is happening."""
         t = design.tokens()
@@ -389,6 +439,18 @@ class GoPilotPage(QWidget):
 
     # ── transcript plumbing ───────────────────────────────────────────────────
     def _clear_transcript(self):
+        # Stop each bubble's pending work BEFORE dropping it. A bubble can
+        # have an image preview downloading or a layer download running, and
+        # both call back into its widgets — so deleting the bubble without
+        # stopping them left a reply to complete into freed memory. That is
+        # the access violation that took QGIS down when a chat containing an
+        # image result was opened from History, since opening one clears the
+        # transcript (twice: here and again when the messages land).
+        for bubble in self._bubbles:
+            try:
+                bubble.cleanup()
+            except RuntimeError:
+                pass            # already gone; nothing left to stop
         self._bubbles = []
         self._empty_state = None
         self._thinking_row = None
@@ -444,7 +506,7 @@ class GoPilotPage(QWidget):
 
     def add_message(self, text, is_user=True, timestamp=None,
                     attachments=None, thinking=None, tool_calls=None,
-                    message_id=None):
+                    message_id=None, files=None):
         """Add one message to the transcript.
 
         ``thinking`` and ``tool_calls`` are what the model did on the way to
@@ -457,7 +519,7 @@ class GoPilotPage(QWidget):
         bubble = MessageBubble(
             text, role="user" if is_user else "ai", timestamp=timestamp,
             client=self.client, iface=self.iface, attachments=attachments,
-            message_id=message_id,
+            message_id=message_id, files=files,
         )
         bubble.delete_requested.connect(self._on_delete_message)
         if not is_user:
@@ -671,6 +733,22 @@ class GoPilotPage(QWidget):
             self._live_bubble.set_content("_Thinking…_")
         return self._thinking_row
 
+    def _rendered_message_ids(self):
+        """Ids of every message already on screen.
+
+        Read off the bubbles rather than kept as a separate set, so it cannot
+        drift from what the user is actually looking at.
+        """
+        ids = set()
+        for bubble in self._bubbles:
+            try:
+                identifier = bubble.message_id
+            except RuntimeError:
+                continue
+            if identifier is not None:
+                ids.add(str(identifier))
+        return ids
+
     def _bubble_in(self, row):
         """The :class:`MessageBubble` inside a transcript row, if any."""
         if row is None:
@@ -705,6 +783,10 @@ class GoPilotPage(QWidget):
         try:
             bubble.set_thinking(self._live_thinking, streaming=True)
             bubble.set_tool_calls(self._live_tool_calls, streaming=True)
+            # Files arrive mid-turn, and "Load results automatically" clicks
+            # the result buttons as soon as they appear — so the style has to
+            # be in place by then, not only at the end of the turn.
+            bubble.set_files(message.get("files"))
             content = message.get("content") or ""
             # Keep the placeholder until there is something to replace it
             # with: a poll during a long reasoning phase carries no content
@@ -751,6 +833,11 @@ class GoPilotPage(QWidget):
         thread = SendMessageThread(
             self.client, text, self.current_chat_id,
             input_metadata=input_metadata, geojson_data=geojson, files=files,
+            # Everything the transcript already shows. The task row can keep
+            # reporting the PREVIOUS turn's `llm_message` until the worker
+            # writes this one, and rendering that is how a new prompt came
+            # back answered with the last reply.
+            known_message_ids=self._rendered_message_ids(),
         )
         thread.finished.connect(self._on_reply)
         thread.error.connect(self._on_send_error)
@@ -789,6 +876,9 @@ class GoPilotPage(QWidget):
                 # The server only has a row for this reply now, so this is the
                 # earliest its trash control can do anything.
                 bubble.set_message_id(llm_message.get("id"))
+                # The files only exist once the task reports them, so the
+                # bubble was opened without them.
+                bubble.set_files(llm_message.get("files"))
             except RuntimeError:
                 self._hide_thinking()
                 self.add_message(message, is_user=False)
@@ -805,6 +895,111 @@ class GoPilotPage(QWidget):
             # this is the earliest the history list can show it.
             self.session_changed.emit(self.current_chat_id)
             self.history_changed.emit()
+        self._reconcile_message_ids()
+
+    def _reconcile_message_ids(self):
+        """Fill in the server ids for bubbles added locally this session.
+
+        A message the user has just sent is drawn immediately — the panel
+        does not wait for a round trip to echo it — so its bubble has no
+        server row behind it. Two things need one:
+
+        * the trash control, which stays hidden until there is something to
+          ask the server to delete;
+        * :meth:`_on_message_deleted`, which removes bubbles BY id, so an
+          id-less prompt survived its own reply being trashed.
+
+        Both of those looked like "you have to leave the page and come back",
+        and that is exactly what was happening: reopening the chat refetched
+        the transcript and every bubble got its id. This does the refetch
+        without rebuilding anything, so nothing flickers and the scroll
+        position and image previews are left alone.
+
+        The reply's own id arrives with the finished task, so this is only
+        ever filling in the prompt — but it is written generally, because the
+        reply's id is missing too on the timeout-recovery path.
+        """
+        if self.client is None or not self.current_chat_id:
+            return
+        if not any(self._needs_an_id(b) for b in self._bubbles):
+            return
+        thread = FetchMessagesThread(self.client, self.current_chat_id)
+        thread.finished.connect(self._on_ids_reconciled)
+        # Deliberately silent on failure: the ids are a nicety, and a failed
+        # refetch must not put an error card in a conversation that worked.
+        thread.error.connect(
+            lambda msg: debug_print(f"[GoPilot] Id reconcile failed: {msg}"))
+        self._threads.append(thread)
+        thread.start()
+
+    @staticmethod
+    def _needs_an_id(bubble):
+        try:
+            return bubble.role != "system" and bubble.message_id is None
+        except RuntimeError:
+            return False
+
+    def _on_ids_reconciled(self, messages):
+        """Match id-less bubbles to server rows by role and text.
+
+        By CONTENT rather than by position: the two lists usually line up,
+        but a turn that failed and left a system notice, or a message trashed
+        from the web app in another tab, is enough to shift them — and
+        assigning the wrong id to a bubble means its trash button deletes
+        somebody else's message.
+        """
+        claimed = set()
+        for bubble in self._bubbles:
+            try:
+                if bubble.message_id is not None:
+                    claimed.add(str(bubble.message_id))
+            except RuntimeError:
+                continue
+
+        for bubble in self._bubbles:
+            if not self._needs_an_id(bubble):
+                continue
+            try:
+                wanted = bubble.raw_text().strip()
+                is_user_bubble = bubble.role == "user"
+            except RuntimeError:
+                continue
+            for message in messages or ():
+                identifier = message.get("id")
+                if identifier is None or str(identifier) in claimed:
+                    continue
+                is_user = message.get("is_user")
+                if is_user is None:
+                    is_user = message.get("role") == "user"
+                if bool(is_user) != is_user_bubble:
+                    continue
+                if (message.get("content") or "").strip() != wanted:
+                    continue
+                try:
+                    bubble.set_message_id(identifier)
+                except RuntimeError:
+                    break
+                claimed.add(str(identifier))
+                break
+
+        # Anything still without an id could not be matched, and a bubble
+        # with no id is the bug being fixed: no trash control, and invisible
+        # to a delete. So fall back to the thing that always works — rebuild
+        # the transcript from the server, which is precisely what reopening
+        # the chat did by hand.
+        #
+        # Deliberately a fallback rather than the first move: a rebuild costs
+        # a flicker, the scroll position and every image preview, and the
+        # match above normally succeeds. But a heuristic on message text
+        # cannot be trusted against a server that trims, normalises or
+        # annotates what it stores, and being right matters more here than
+        # being smooth.
+        stranded = [b for b in self._bubbles if self._needs_an_id(b)]
+        if stranded:
+            debug_print(
+                f"[GoPilot] {len(stranded)} bubble(s) could not be matched "
+                f"to a server row; rebuilding the transcript")
+            self._on_messages_loaded(messages)
 
     def _on_delete_message(self, message_id):
         """Trash one exchange, after asking.
@@ -848,10 +1043,109 @@ class GoPilotPage(QWidget):
                 continue
             row = bubble.parentWidget()
             self._bubbles.remove(bubble)
+            # Stop the bubble's own pending work before dropping its row, for
+            # the same reason _clear_transcript does.
+            try:
+                bubble.cleanup()
+            except RuntimeError:
+                pass
             if row is not None:
                 row.setParent(None)
                 row.deleteLater()
         self.history_changed.emit()
+
+        # Deleting the LAST exchange empties the session, and an empty
+        # session is the same thing as a deleted one — so go to a new chat
+        # rather than leaving the user looking at a blank transcript that
+        # still points at a session with nothing in it. Deleting one of
+        # several leaves the rest to read, so nothing moves.
+        if self._conversation_bubbles() == 0:
+            self.start_new_chat()
+            return
+
+        # Then ask the server what the transcript actually is now.
+        #
+        # Removing bubbles by id above is the OPTIMISTIC half: it is instant,
+        # and it is right whenever we hold an id for everything the server
+        # trashed. It is not always right. The backend takes a whole turn and
+        # reports the rows it moved in `trashed_ids`, but a build that does
+        # not send that list falls back to the single id we asked about — and
+        # a prompt drawn locally this session may have had no id to match in
+        # the first place. Either way the pair's other half stayed on screen
+        # as an orphan until the chat was reopened, which is exactly the
+        # "leave the page and come back" that was reported.
+        #
+        # The SaaS has never had this bug because it does not do arithmetic
+        # on ids at all: its delete invalidates the messages query and the
+        # list is rebuilt from the server. This is that, minus the rebuild in
+        # the case where the optimistic removal already agreed with it.
+        self._resync_transcript()
+
+    def _resync_transcript(self):
+        """Refetch the session and rebuild only if it disagrees with us.
+
+        Checking before rebuilding is what keeps this invisible: in the
+        common case the optimistic update was already correct, and a rebuild
+        would cost a flicker, the scroll position and every image preview for
+        no change at all.
+        """
+        if self.client is None or not self.current_chat_id:
+            return
+        thread = FetchMessagesThread(self.client, self.current_chat_id)
+        thread.finished.connect(self._on_resync)
+        # Silent: the optimistic update is already on screen, and an error
+        # card about a bookkeeping refetch would be noise about a delete that
+        # worked.
+        thread.error.connect(
+            lambda msg: debug_print(f"[GoPilot] Resync failed: {msg}"))
+        self._threads.append(thread)
+        thread.start()
+
+    def _on_resync(self, messages):
+        if not messages:
+            # The server has nothing left in this session.
+            self.start_new_chat()
+            return
+
+        server_ids = {str(m.get("id")) for m in messages
+                      if m.get("id") is not None}
+        shown_ids = set()
+        for bubble in self._bubbles:
+            try:
+                if bubble.role != "system" and bubble.message_id is not None:
+                    shown_ids.add(str(bubble.message_id))
+            except RuntimeError:
+                continue
+
+        # An id-less bubble is not a disagreement on its own — a message sent
+        # moments ago has no id yet, and `_reconcile_message_ids` is what
+        # gives it one. A MISMATCH of real ids is a disagreement.
+        if shown_ids == server_ids and not any(
+                self._needs_an_id(b) for b in self._bubbles):
+            return
+
+        debug_print(f"[GoPilot] Transcript out of step with the server "
+                    f"(showing {sorted(shown_ids)}, server has "
+                    f"{sorted(server_ids)}); rebuilding")
+        self._on_messages_loaded(messages)
+
+    def _conversation_bubbles(self):
+        """How many bubbles the user would call part of the conversation.
+
+        System notices do not count — an error card is not a chat, and one
+        left over from a failed turn would otherwise make an emptied session
+        look like it still had something in it. Counted by ROLE rather than
+        by having a server id, because a message that has only just been sent
+        does not have an id yet and is still very much part of the chat.
+        """
+        total = 0
+        for bubble in self._bubbles:
+            try:
+                if bubble.role != "system":
+                    total += 1
+            except RuntimeError:
+                continue        # C++ side already gone; it is not on screen
+        return total
 
     def _on_send_error(self, message):
         self._hide_thinking()
@@ -901,6 +1195,10 @@ class GoPilotPage(QWidget):
                 thinking=thinking_text(message.get("thinking_content")),
                 tool_calls=message.get("tool_calls_content"),
                 message_id=message.get("id"),
+                # The API's file list for this message, which carries each
+                # file's SLD. Read from the server on every reload, so a
+                # reopened chat styles its layers exactly like a live one.
+                files=message.get("files"),
             )
         self._set_status("", busy=False)
 
@@ -987,6 +1285,15 @@ class GoPilotPage(QWidget):
     def cleanup(self):
         """Stop threads and release the map tool. Safe to call twice."""
         stop_threads(self._threads)
+        # The bubbles own pending work of their own (previews, downloads) that
+        # `stop_threads` above knows nothing about. On unload the whole panel
+        # is destroyed, so anything still running would complete into freed
+        # widgets.
+        for bubble in self._bubbles:
+            try:
+                bubble.cleanup()
+            except RuntimeError:
+                pass
         if getattr(self, "geo_manager", None) is not None:
             try:
                 self.geo_manager.cleanup()

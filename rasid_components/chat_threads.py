@@ -128,7 +128,7 @@ class SendMessageThread(QThread):
     partial = pyqtSignal(dict)
 
     def __init__(self, client, message, session_id=None, input_metadata=None,
-                 geojson_data=None, files=None):
+                 geojson_data=None, files=None, known_message_ids=None):
         super().__init__()
         self.client = client
         self.message = message
@@ -136,6 +136,17 @@ class SendMessageThread(QThread):
         self.input_metadata = input_metadata
         self.geojson_data = geojson_data
         self.files = list(files) if files else None
+        # Ids of the assistant messages the transcript ALREADY shows.
+        #
+        # `GET sessions/tasks/{id}/` carries an `llm_message`, and until the
+        # worker has written this turn's row that field can still hold the
+        # PREVIOUS turn's message — a complete one, with its own thinking and
+        # tool calls. Rendering it is the "I sent a prompt and got the last
+        # answer again" bug: the plugin was showing a real message, just not
+        # the one it had asked for. Anything whose id is in here is therefore
+        # not ours and is ignored until a new id appears.
+        self.known_message_ids = {str(i) for i in (known_message_ids or ())
+                                  if i is not None}
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _collect_uploads(self):
@@ -214,7 +225,7 @@ class SendMessageThread(QThread):
                 self.progress.emit(f"GoPilot is thinking… {pct}%")
 
             message = status.get("llm_message")
-            if isinstance(message, dict):
+            if isinstance(message, dict) and self._is_this_turn(message):
                 latest = message
                 # Only emit when something a reader would SEE has changed.
                 # A poll that returns an identical body still arrives every
@@ -243,6 +254,28 @@ class SendMessageThread(QThread):
                     f"{status.get('error_message') or status.get('error') or 'Task failed'}")
         return None
 
+    def _is_this_turn(self, message):
+        """Is this ``llm_message`` the answer to the message we just sent?
+
+        Two ways it is not:
+
+        * its id is one the transcript already shows — the task row has not
+          caught up and is still reporting the previous turn;
+        * it carries nothing renderable at all, which is the SaaS's own
+          ``hasAnyStreamedField`` check: an empty shell is a row that exists
+          but has not been written to yet, and rendering it blanks a bubble
+          that currently says "Thinking…".
+        """
+        identifier = message.get("id")
+        if identifier is not None and str(identifier) in self.known_message_ids:
+            debug_print(f"[GoPilot] Ignoring stale llm_message {identifier} "
+                        f"(already in the transcript)")
+            return False
+        return bool(message.get("content")
+                    or message.get("thinking_content")
+                    or message.get("tool_calls_content")
+                    or message.get("files"))
+
     def _last_assistant_message(self, gopilot):
         """Fall back to reading the transcript when polling timed out.
 
@@ -253,6 +286,15 @@ class SendMessageThread(QThread):
         for msg in reversed(gopilot.get_messages(self.session_id) or []):
             if msg.get("role") == "assistant" or msg.get("is_user") is False:
                 if msg.get("content") or msg.get("files"):
+                    # Only if it is NEW. Walking back from the end of the
+                    # transcript finds the previous answer just as readily as
+                    # this turn's, so without this the timeout path reported
+                    # the last reply a second time — the same duplicate the
+                    # poll loop now guards against.
+                    identifier = msg.get("id")
+                    if (identifier is not None
+                            and str(identifier) in self.known_message_ids):
+                        return None
                     return msg
         return None
 
@@ -466,10 +508,19 @@ class DeleteChatThread(QThread):
 
 
 class DownloadLayerThread(QThread):
-    """Download one result file to a fresh temp directory."""
+    """Download one result file to a fresh temp directory.
+
+    The single download thread for the whole plugin. The processes pane had
+    its own near-identical copy, which lacked the extension fix-up below and
+    the shared error wording, so the same download reported differently
+    depending on which pane started it.
+    """
 
     finished = pyqtSignal(str)  # local path
     error = pyqtSignal(str)
+    #: (bytes so far, total bytes) — total is 0 when the server sends no
+    #: Content-Length, which the UI shows as bytes rather than a percentage.
+    progress = pyqtSignal(int, int)
 
     def __init__(self, client, url, filename=None):
         super().__init__()
@@ -480,7 +531,8 @@ class DownloadLayerThread(QThread):
     def run(self):
         try:
             path = self.client.download_file(
-                self.url, tempfile.mkdtemp(prefix="rasid_download_"))
+                self.url, tempfile.mkdtemp(prefix="rasid_download_"),
+                progress=self._report)
             # Presigned URLs often have no extension, and QGIS picks its
             # provider from the suffix — so restore it from the link's label.
             if self.filename:
@@ -491,6 +543,17 @@ class DownloadLayerThread(QThread):
             self.finished.emit(path)
         except Exception as exc:
             self.error.emit(_describe_error(exc))
+
+    def _report(self, done, total):
+        """Forward progress, unless we are being torn down.
+
+        The check matters: this runs on the worker thread for every 8KB, and
+        a panel being closed mid-download should stop talking to the UI
+        rather than queue another few hundred signals at it.
+        """
+        if self.isInterruptionRequested():
+            return
+        self.progress.emit(int(done), int(total))
 
 
 def stop_threads(threads, timeout_ms=1500):

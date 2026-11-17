@@ -33,6 +33,12 @@ AUTO_LOAD_LAYERS = "auto_load_layers"
 # Chat
 SHOW_TIMESTAMPS = "show_timestamps"
 SEND_ON_ENTER = "send_on_enter"
+# Drawing. Where the user last parked the floating draw bar, as "x,y" in
+# screen coordinates. Empty means "put it in the default corner" — and a
+# saved point is re-validated against the current screens before being
+# used, because a position from a monitor that has since been unplugged
+# would otherwise hide the bar off-screen permanently.
+DRAW_BAR_POS = "draw_bar_pos"
 
 DEFAULTS = {
     LAYER_GROUP_ENABLED: True,
@@ -44,6 +50,7 @@ DEFAULTS = {
     AUTO_LOAD_LAYERS: False,
     SHOW_TIMESTAMPS: True,
     SEND_ON_ENTER: True,
+    DRAW_BAR_POS: "",
 }
 
 

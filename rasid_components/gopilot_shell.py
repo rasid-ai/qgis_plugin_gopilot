@@ -67,14 +67,15 @@ VIEW_TITLES = {
 
 
 class FetchProfileThread(QThread):
-    """Load the signed-in user's profile and their GoToken wallet.
+    """Load the profile, the GoToken wallet and the plan entitlements.
 
-    Two requests, because they are two endpoints — the balance is not part of
-    the profile response (see ``RasidClient.get_gotokens``).
+    Three requests, because they are three endpoints — the balance is not part
+    of the profile response (see ``RasidClient.get_gotokens``) and the plan is
+    not part of either (``get_entitlements``).
 
-    The wallet is fetched in its own try block so a billing hiccup cannot blank
-    out the name and email as well; the account card then simply shows no
-    balance rather than a wrong one.
+    Each billing call sits in its OWN try block so one failing cannot blank
+    the others or the name and email: the account card shows no balance rather
+    than a wrong one, and the plan card hides rather than inventing a plan.
     """
 
     finished = pyqtSignal(dict)
@@ -102,6 +103,16 @@ class FetchProfileThread(QThread):
             # and the card says so rather than showing a figure it never got.
             debug_print(f"[RASID] GoToken wallet fetch failed: {exc}")
             data["gotokens_error"] = str(exc)
+
+        try:
+            data["entitlements"] = self.client.get_entitlements()
+        except Exception as exc:
+            # Same rule as the wallet: absent is not empty. A failed request
+            # hides the plan card rather than drawing a card that claims the
+            # user is on no plan with no storage.
+            debug_print(f"[RASID] Entitlements fetch failed: {exc}")
+            data["entitlements_error"] = str(exc)
+
         self.finished.emit(data)
 
 
@@ -218,6 +229,8 @@ class GoPilotShell(QWidget):
         # History <-> chat.
         self.history_page.chat_selected.connect(self._open_chat)
         self.history_page.new_chat_requested.connect(self.new_chat)
+        self.history_page.current_chat_discarded.connect(
+            self._discard_current_chat)
         self.chat_page.history_changed.connect(self.history_page.load)
         self.chat_page.session_changed.connect(
             lambda chat_id: self.history_page.set_current(chat_id or None))
@@ -328,6 +341,16 @@ class GoPilotShell(QWidget):
         self.chat_page.start_new_chat()
         self.show_view("chat")
 
+    def _discard_current_chat(self):
+        """Reset the chat page in place, without changing the view.
+
+        `new_chat()` without the `show_view`. Used when the open conversation
+        is deleted from the history list: the page has to stop pointing at a
+        session the server no longer has, but the user is still working in
+        History and should not be moved out of it.
+        """
+        self.chat_page.start_new_chat()
+
     def _open_chat(self, chat_id, title):
         self.chat_page.open_chat(chat_id, title)
         self.history_page.set_current(chat_id)
@@ -370,6 +393,11 @@ class GoPilotShell(QWidget):
         """
         for page in (getattr(self, "chat_page", None),
                      getattr(self, "history_page", None),
+                     # ProcessesPage was missing from this list even though
+                     # it starts threads of its own; its refresh timer was
+                     # being stopped from out here instead, which is why the
+                     # special case below exists.
+                     getattr(self, "processes_page", None),
                      getattr(self, "settings_page", None)):
             if page is not None and hasattr(page, "cleanup"):
                 try:

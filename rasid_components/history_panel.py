@@ -219,6 +219,10 @@ class HistoryPanel(QWidget):
 
     chat_selected = pyqtSignal(str, str)   # (chat_id, title)
     new_chat_requested = pyqtSignal()
+    # The open conversation was deleted from under the chat page: reset it,
+    # but do NOT navigate. Deliberately separate from `new_chat_requested`,
+    # which means "take me to a new chat".
+    current_chat_discarded = pyqtSignal()
 
     def __init__(self, client, parent=None):
         super().__init__(parent)
@@ -393,12 +397,31 @@ class HistoryPanel(QWidget):
         debug_print(f"[GoPilot] Rename failed: {message}")
 
     def _on_deleted(self, chat_id):
+        """Where the user ends up after a delete depends on what is left.
+
+        Deleting one of ten conversations leaves nine still to manage, so
+        they stay in the list — being thrown into an empty chat after each
+        delete meant navigating back for every single one. Deleting the LAST
+        one leaves nothing to manage, and an empty History is a dead end, so
+        that case goes on to a new chat.
+
+        Either way the chat page has to stop pointing at the conversation
+        that was open if it is the one that just went, or the composer would
+        post the next message to a session the server no longer has.
+        `new_chat_requested` already resets it; `current_chat_discarded` is
+        the reset WITHOUT the navigation.
+        """
         self._all_chats = [c for c in self._all_chats
                            if c.get("id") != chat_id]
-        if str(chat_id) == self._current_id:
+        was_open = str(chat_id) == self._current_id
+        if was_open:
             self._current_id = None
-            self.new_chat_requested.emit()
         self._render()
+
+        if not self._all_chats:
+            self.new_chat_requested.emit()
+        elif was_open:
+            self.current_chat_discarded.emit()
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def cleanup(self):

@@ -29,6 +29,7 @@ from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer
 from qgis.PyQt.QtWidgets import QDialog, QVBoxLayout, QListWidget, QHBoxLayout, QLabel, QMessageBox
 from qgis.core import QgsProject, QgsVectorLayer, QgsWkbTypes, QgsJsonExporter, QgsCoordinateReferenceSystem, QgsCoordinateTransform
 from ..compat import exec_dialog
+from ..logger import debug_print
 from .. import design
 from ..widgets import primary_button, secondary_button
 from .modern_draw_tool import ModernDrawTool
@@ -120,8 +121,36 @@ class GeometryInputManager(QObject):
                 # User cancelled the help dialog
                 return
 
-        # Store previous map tool to restore later
-        self._prev_map_tool = self.canvas.mapTool()
+        # ALREADY DRAWING? Tear the live tool down before making another.
+        #
+        # `self._draw_tool` is the only strong reference to the map tool.
+        # QgsMapTool takes the canvas in its constructor but the canvas does
+        # NOT own the tool, so simply overwriting this attribute dropped the
+        # last reference, Python freed the C++ object, and the canvas was left
+        # holding a dangling pointer to its active tool — the next click or
+        # mouse move over the map then read freed memory and took QGIS down
+        # with an access violation. Pressing "Draw on map" a second time
+        # while the first draw was still in progress was enough to do it,
+        # and nothing in the UI prevents that.
+        #
+        # Tearing down first also keeps `_prev_map_tool` honest: captured
+        # after this, it is the tool the user actually had before drawing,
+        # not the draw tool we are about to replace.
+        if self._draw_tool is not None:
+            debug_print("[GoPilot] Draw restarted while active; "
+                        "tearing down the previous tool first")
+            self._teardown_draw_tool()
+
+        # Store previous map tool to restore later.
+        #
+        # Never one of OURS. If the canvas had no tool before the first draw,
+        # `_restore_map_state` has nothing to restore to and leaves our own
+        # tool as the canvas's active one — so a restart captured the draw
+        # tool it had just torn down, and finishing the second draw would
+        # "restore" the canvas to a tool that no longer exists.
+        previous = self.canvas.mapTool()
+        self._prev_map_tool = (None if isinstance(previous, ModernDrawTool)
+                               else previous)
 
         # Create and activate drawing tool
         self._draw_tool = ModernDrawTool(self.canvas)
@@ -187,6 +216,15 @@ class GeometryInputManager(QObject):
                 tool.deactivate()
             except RuntimeError:
                 pass
+            # Take it off the canvas BEFORE deleting it. With no previous
+            # tool to restore, `_restore_map_state` does not swap anything,
+            # which left the canvas pointing at the tool we are about to
+            # delete on the next line.
+            if self._prev_map_tool is None and self.canvas is not None:
+                try:
+                    self.canvas.unsetMapTool(tool)
+                except RuntimeError:
+                    pass
             try:
                 tool.deleteLater()
             except RuntimeError:

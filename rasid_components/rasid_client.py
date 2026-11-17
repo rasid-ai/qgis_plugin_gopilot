@@ -225,6 +225,46 @@ class RasidClient:
         response.raise_for_status()
         return response.json()
 
+    def get_entitlements(self):
+        """Plan, limits, wallet and subscription in one call.
+
+        ``GET /billing/me/`` — the endpoint the SaaS reads for its own
+        subscription card. Fetched separately from the wallet because it
+        answers a different question: the wallet is "what can I spend right
+        now", this is "what am I entitled to and until when".
+
+        Returns the watcher's shape (trimmed to what the plugin shows)::
+
+            {
+              "plan_code": "pro",
+              "plan_name": "Pro",
+              "limits": {"storage_bytes": 107374182400, ...},
+              "gotokens": {"balance": "2404153.0000",      # decimals AS STRINGS
+                           "monthly_allowance": "...",
+                           "period_end": "2026-12-01", ...} | null,
+              "storage": {"used_bytes": 1234, "limit_bytes": 5678,
+                          "unlimited": false, "over": false,
+                          "fraction": 0.21, ...},            # may be ABSENT
+              "subscription": {"status": "active",
+                               "current_period_end": "2026-12-01",
+                               "cancel_at_period_end": false, ...} | null,
+            }
+
+        Three nullable things, each meaning something distinct and none of
+        them meaning zero:
+
+        * ``gotokens`` null — an account provisioned before billing existed.
+        * ``storage`` absent — a watcher older than the storage counter.
+        * ``subscription`` null — no paid subscription (free, or comped by
+          hand in the admin), so there is no renewal date to show.
+        """
+        response = self.session.get(
+            self.base_url + "billing/me/",
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def get_user_projects(self, hidden=False):
         """Get list of user's projects."""
         params = {"hidden": str(hidden).lower()}
@@ -436,7 +476,7 @@ class RasidClient:
                     detail = f"Server error ({response.status_code}): {response.text[:200]}"
             raise Exception(str(detail))
 
-    def download_file(self, url, dest_dir=None):
+    def download_file(self, url, dest_dir=None, progress=None):
         """
         Download a file from the API and save it locally with path traversal protection.
 
@@ -519,9 +559,32 @@ class RasidClient:
                 f"File would be written outside download directory."
             )
 
-        # Safe to write file
+        # Safe to write file.
+        #
+        # ``progress(done, total)`` is called as the bytes land, so a caller
+        # can say "43%" instead of an indefinite "Downloading…". ``total`` is
+        # 0 when the server sends no Content-Length (a chunked response), and
+        # callers are expected to fall back to showing bytes so far — hence
+        # reporting it rather than guessing a percentage from nothing.
+        total = 0
+        try:
+            total = int(response.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            total = 0
+
+        done = 0
         with open(filepath, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
                 f.write(chunk)
+                done += len(chunk)
+                if progress is not None:
+                    try:
+                        progress(done, total)
+                    except Exception:
+                        # A reporting callback must never break the download
+                        # it is only describing.
+                        progress = None
 
         return filepath

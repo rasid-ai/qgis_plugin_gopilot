@@ -10,6 +10,8 @@ from .compat import (
     exec_dialog,
     QMessageBox_Question, QMessageBox_Yes, QMessageBox_No
 )
+from .chat_threads import stop_threads
+from .downloads import DownloadButton
 from .image_loader import load_image
 from .create_process_wizard import CreateProcessWizard
 from . import design
@@ -132,23 +134,6 @@ class HideProcessThread(QThread):
             self.error.emit(str(e))
 
 
-class DownloadThread(QThread):
-    finished = pyqtSignal(str)
-    error = pyqtSignal(str)
-
-    def __init__(self, client, url):
-        super().__init__()
-        self.client = client
-        self.url = url
-
-    def run(self):
-        try:
-            path = self.client.download_file(self.url)
-            self.finished.emit(path)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
 def _layer_exists_in_qgis(layer_name):
     """Check if a layer with the given name already exists in QGIS project."""
     from qgis.core import QgsProject
@@ -185,6 +170,8 @@ class ProcessesPage(QWidget):
         self.client = client
         self.iface = iface
         self._threads = []
+        # One controller per download button on the detail pane.
+        self._downloads = []
         self._current_project = None
         self._selected_row = None
         self._current_processes = []
@@ -759,6 +746,16 @@ class ProcessesPage(QWidget):
 
     def _clear_detail(self):
         """Empty the detail pane and forget every handle into it."""
+        # The download controllers go with the buttons they drive. Each one
+        # holds a connection to the project's layersRemoved signal, so one
+        # left behind would keep firing at a button that no longer exists.
+        for controller in self._downloads:
+            try:
+                controller.cleanup()
+            except RuntimeError:
+                pass
+        self._downloads = []
+
         self._detail_thumbnail = None
         self._status_badge = None
         self._status_row = None
@@ -1095,74 +1092,36 @@ class ProcessesPage(QWidget):
             if not url:
                 continue
             layer_name = f"{process_name} ({suffix})"
+            button = (primary_button(label, icon_name="download") if primary
+                      else secondary_button(label, icon_name="download"))
+
+            # Behaviour from the shared controller, which also drives the
+            # chat's result buttons. Both panes used to carry their own copy
+            # and both left the button disabled for good once the layer was
+            # loaded — so removing the layer from QGIS gave no way to fetch
+            # it again short of leaving the pane and coming back.
+            controller = DownloadButton(
+                button, self.client, url,
+                add_layer=lambda path, n=layer_name: _add_layer_to_qgis(
+                    path, n),
+                idle_text=label,
+                busy_text="Downloading…",
+                done_text="Loaded",
+                # From the URL, so a link ending in "/download/" still lands
+                # with a suffix QGIS can pick a provider from.
+                filename=url.rsplit("/", 1)[-1].split("?")[0] or None,
+                threads=self._threads,
+            )
             if _layer_exists_in_qgis(layer_name):
-                # Already in the project: a disabled secondary button with a
-                # tick, rather than a green one. Green reads as "do this",
-                # and this is the one state where there is nothing to do.
-                button = secondary_button("Already loaded", icon_name="check")
-                button.setEnabled(False)
-            elif primary:
-                button = primary_button(label, icon_name="download")
-                # `b=button` binds this iteration's button. Closing over the
-                # loop variable instead would give both buttons the LAST one,
-                # so clicking Download result would disable the dataset button.
-                button.clicked.connect(
-                    lambda _=False, u=url, n=layer_name, b=button:
-                    self._download_and_load(u, n, b))
-            else:
-                button = secondary_button(label, icon_name="download")
-                # `b=button` binds this iteration's button. Closing over the
-                # loop variable instead would give both buttons the LAST one,
-                # so clicking Download result would disable the dataset button.
-                button.clicked.connect(
-                    lambda _=False, u=url, n=layer_name, b=button:
-                    self._download_and_load(u, n, b))
+                # Already in the project from an earlier session: show the
+                # loaded state, but still clickable, like every other one.
+                controller.mark_loaded(layer_name)
+            self._downloads.append(controller)
             card.add(button)
 
         self._insert_before_stretch(card)
 
     # ── Download & load into QGIS ──
-
-    def _download_and_load(self, url, layer_name, button):
-        """Download a result and add it to the QGIS project.
-
-        The button carries its own progress: it is the thing the user clicked
-        and the only place the outcome belongs. Three states, all through the
-        secondary style rather than a repainted green — the finished state used
-        to set a hardcoded ``#10b981`` fill, the only button in the panel that
-        went green on success, and once set it stayed green through theme
-        changes because nothing re-applied it.
-        """
-        button.setEnabled(False)
-        button.setText("Downloading…")
-
-        thread = DownloadThread(self.client, url)
-
-        def on_done(filepath):
-            try:
-                _add_layer_to_qgis(filepath, layer_name)
-                # Matches the "Already loaded" state a reopened pane shows, so
-                # the pane looks the same whether the layer was added just now
-                # or in a previous session.
-                button.setText("Already loaded")
-                button.setIcon(icons.icon("check", design.ICON_SM,
-                                          design.tokens().text_secondary))
-            except Exception as e:
-                QMessageBox.warning(self, "Load Error",
-                                    f"Downloaded but failed to load:\n{e}")
-                button.setEnabled(True)
-                button.setText("Retry download")
-
-        def on_err(msg):
-            QMessageBox.warning(self, "Download Error",
-                                f"Failed to download:\n{msg}")
-            button.setEnabled(True)
-            button.setText("Retry download")
-
-        thread.finished.connect(on_done)
-        thread.error.connect(on_err)
-        self._threads.append(thread)
-        thread.start()
 
     # ── Hide process ──
 
@@ -1242,3 +1201,31 @@ class ProcessesPage(QWidget):
             self._body_stack.removeWidget(self._wizard)
             self._wizard.deleteLater()
             self._wizard = None
+
+    # ── teardown ──────────────────────────────────────────────────────────────
+    def cleanup(self):
+        """Stop this page's own work. Safe to call more than once.
+
+        This page had no cleanup at all, and the shell's teardown reached
+        into it from outside to stop the refresh timer. It starts threads of
+        its own and now owns download controllers holding project signal
+        connections, so it needs to let go of them itself: a Python slot
+        still connected while the interpreter finalises takes the process
+        down with no traceback.
+        """
+        for controller in self._downloads:
+            try:
+                controller.cleanup()
+            except RuntimeError:
+                pass
+        self._downloads = []
+
+        timer = getattr(self, "_refresh_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+
+        stop_threads(self._threads)
+        self._threads = []

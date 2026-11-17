@@ -326,6 +326,18 @@ def _draw_sparkle(p):                                    # sparkles
     _line(p, 15.5, 6.5, 20.5, 6.5)
 
 
+def _draw_grip(p):                                       # grip-vertical
+    """Six dots: the "this is draggable" affordance.
+
+    Drawn rather than borrowed from a font so it matches the rest of the set
+    at every size — the host font's ⠿ is a braille glyph whose weight and
+    spacing are whatever the shipped typeface decided.
+    """
+    for x in (9.5, 14.5):
+        for y in (7.0, 12.0, 17.0):
+            _fill_circle(p, x, y, 1.15)
+
+
 def _star_points(outer=9.6, inner=4.2):
     """The ten points of a five-pointed star on the 24-unit grid.
 
@@ -398,6 +410,7 @@ _ICONS = {
     "alert": _draw_alert,
     "star": _draw_star,
     "star-filled": _draw_star_filled,
+    "grip": _draw_grip,
 }
 
 

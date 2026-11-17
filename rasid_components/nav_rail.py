@@ -44,10 +44,14 @@ from .widgets import Divider, IconButton, paint_transparent
 
 # (key, icon name, tooltip). Order is top-to-bottom.
 NAV_ITEMS = (
+    # Chat history sits directly under New chat because the two belong
+    # together: both are about conversations, and the rail reads top-down as
+    # "start one / go back to one". Projects and GoBox used to come between
+    # them, which split the chat pair with two unrelated views.
     ("new-chat", "new-chat", "New chat"),
+    ("history", "history", "Chat history"),
     ("projects", "projects", "Projects"),
     ("gobox", "gobox", "GoBox — ready-made solutions"),
-    ("history", "history", "Chat history"),
     # Settings sits with the others because it IS one of them: it opens a view
     # in the same stack. It used to live alone in the bottom footer, which
     # grouped it with the window controls it has nothing to do with.

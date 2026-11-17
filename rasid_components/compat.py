@@ -272,3 +272,37 @@ def mouse_global_pos(event):
     if getter is not None:
         return getter().toPoint()
     return event.globalPos()
+
+try:
+    from qgis.PyQt import sip as _sip
+except ImportError:                                  # pragma: no cover
+    try:
+        import sip as _sip                           # Qt5 standalone layout
+    except ImportError:
+        _sip = None
+
+
+def is_alive(obj):
+    """True if ``obj``'s underlying C++ object still exists.
+
+    A Python wrapper outlives the C++ object it wraps. When a parent widget is
+    destroyed, Qt deletes its children immediately, but any Python reference
+    to one of them — in a list, or captured by a closure connected to a signal
+    — keeps the wrapper alive and perfectly callable-looking. Calling through
+    it then reads freed memory, and on Windows that is an access violation
+    rather than a Python exception, so there is no traceback to work from.
+
+    That is the shape of the crash that took QGIS down when a chat was opened
+    while an image preview was still downloading: the reply's ``finished``
+    signal reached a closure holding a QLabel whose parent bubble had just
+    been deleted.
+
+    ``sip.isdeleted`` is the only reliable answer; without sip this returns
+    True and callers fall back to their own ``try``/``except RuntimeError``.
+    """
+    if _sip is None:
+        return True
+    try:
+        return not _sip.isdeleted(obj)
+    except (TypeError, RuntimeError):
+        return False

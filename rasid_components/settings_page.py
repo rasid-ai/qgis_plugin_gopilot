@@ -22,19 +22,22 @@ be opened before the profile request comes back.
 
 import os
 import sys
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 from qgis.PyQt.QtCore import QUrl, pyqtSignal
 from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import (
-    QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QLineEdit, QProgressBar, QVBoxLayout, QWidget,
 )
 
 from . import design, icons, prefs
 from .formatting import format_tokens
+from .uploads import format_bytes
 from .compat import (
     Qt_AlignVCenter, Qt_ElideMiddle, Qt_TextBrowserInteraction,
 )
-from .config import APP_BASE_URL, WEBSITE_URL
+from .config import APP_BASE_URL, WEBSITE_URL, plugin_version
 from .dependencies import venv_manager
 from .logger import debug_print
 from .widgets import (
@@ -45,7 +48,40 @@ from .widgets import (
     styled_scroll_area,
 )
 
-PLUGIN_VERSION = "2.0.0"
+def _format_date(raw):
+    """An ISO date from the API as "1 Dec 2026", or ``None``.
+
+    Returns None rather than the raw string for anything unparseable: a
+    renewal line reading "Renews 2026-12-01T00:00:00Z" is worse than no
+    renewal line, and a wrong date here is a billing question.
+    """
+    if not raw:
+        return None
+    text = str(raw).strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text[:10], "%Y-%m-%d")
+        except ValueError:
+            return None
+    return f"{parsed.day} {parsed.strftime('%b %Y')}"
+
+
+def _fraction(used, total):
+    """``used / total`` clamped to 0..1, or ``None`` if either is unusable.
+
+    Decimal, not float, for the same reason :func:`format_tokens` is: these
+    arrive as decimal strings and a token balance is money-shaped.
+    """
+    try:
+        used_value = Decimal(str(used))
+        total_value = Decimal(str(total))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if total_value <= 0:
+        return None
+    return max(0.0, min(1.0, float(used_value / total_value)))
 
 
 class SettingsPage(QWidget):
@@ -81,6 +117,7 @@ class SettingsPage(QWidget):
         self._body.setSpacing(design.SPACE_3)
 
         self._body.addWidget(self._build_account())
+        self._body.addWidget(self._build_plan())
         self._body.addWidget(self._build_layers())
         self._body.addWidget(self._build_chat())
         self._body.addWidget(self._build_libraries())
@@ -151,6 +188,8 @@ class SettingsPage(QWidget):
 
         self._set_balance((data or {}).get("gotokens"),
                           (data or {}).get("gotokens_error"))
+        self._set_plan((data or {}).get("entitlements"),
+                       (data or {}).get("entitlements_error"))
 
     def _set_balance(self, gotokens, error=None):
         """Show the GoToken balance, or nothing at all if it is unknown.
@@ -201,7 +240,171 @@ class SettingsPage(QWidget):
         )
         self._balance_label.setVisible(True)
 
-    # ── 2. Map & layers ───────────────────────────────────────────────────────
+    # ── 2. Plan ───────────────────────────────────────────────────────────────
+    def _build_plan(self):
+        """What the account is entitled to: tokens, storage, renewal.
+
+        Its own card rather than more lines in Account, because it answers a
+        different question — Account is "who am I", this is "what have I got
+        left". Hidden in its entirety until the entitlements land: a plan card
+        showing zeros is worse than no plan card, for the same reason the
+        balance label hides (see :meth:`_set_balance`).
+        """
+        self._plan_card = SectionCard("Plan", icon_name="sparkle")
+
+        self._plan_name = body_label("", design.TEXT_MD)
+        self._plan_name.setStyleSheet(design.field_label_qss())
+        self._plan_card.add(self._plan_name)
+
+        self._plan_renewal = body_label("", design.TEXT_SM, secondary=True)
+        self._plan_card.add(self._plan_renewal)
+
+        self._plan_card.add_spacing(design.SPACE_2)
+
+        self._tokens_caption = body_label("", design.TEXT_SM, secondary=True)
+        self._plan_card.add(self._tokens_caption)
+        self._tokens_meter = QProgressBar()
+        self._tokens_meter.setTextVisible(False)
+        self._tokens_meter.setRange(0, 1000)
+        self._plan_card.add(self._tokens_meter)
+
+        self._plan_card.add_spacing(design.SPACE_2)
+
+        self._storage_caption = body_label("", design.TEXT_SM, secondary=True)
+        self._plan_card.add(self._storage_caption)
+        self._storage_meter = QProgressBar()
+        self._storage_meter.setTextVisible(False)
+        self._storage_meter.setRange(0, 1000)
+        self._plan_card.add(self._storage_meter)
+
+        self._plan_card.setVisible(False)
+        return self._plan_card
+
+    def _set_plan(self, entitlements, error=None):
+        """Fill the plan card, or hide it.
+
+        Every figure here is optional at the API, and each absence means
+        something different from zero — see ``RasidClient.get_entitlements``.
+        So each row is shown only when its own data arrived, and the card
+        itself only when at least one row did.
+        """
+        if error or not isinstance(entitlements, dict):
+            self._plan_card.setVisible(False)
+            return
+
+        rows = 0
+
+        name = entitlements.get("plan_name") or entitlements.get("plan_code")
+        self._plan_name.setText(str(name) if name else "")
+        self._plan_name.setVisible(bool(name))
+        rows += bool(name)
+
+        rows += self._set_renewal(entitlements.get("subscription"),
+                                  entitlements.get("gotokens"))
+        rows += self._set_token_meter(entitlements.get("gotokens"))
+        rows += self._set_storage_meter(entitlements.get("storage"))
+
+        self._plan_card.setVisible(rows > 0)
+
+    def _set_renewal(self, subscription, gotokens):
+        """When the allowance next resets, and whether it is a renewal at all.
+
+        A subscription with ``cancel_at_period_end`` is NOT renewing on that
+        date, it is ending on it, so the two cannot share one sentence. With
+        no subscription row the wallet's own period is used — a comped or
+        pre-billing account still has an allowance that rolls over.
+        """
+        date = None
+        word = "Renews"
+        if isinstance(subscription, dict):
+            date = _format_date(subscription.get("current_period_end"))
+            if subscription.get("cancel_at_period_end"):
+                word = "Ends"
+        if date is None and isinstance(gotokens, dict):
+            date = _format_date(gotokens.get("period_end"))
+            word = "Allowance resets"
+        self._plan_renewal.setText(f"{word} {date}" if date else "")
+        self._plan_renewal.setVisible(date is not None)
+        return 1 if date is not None else 0
+
+    def _set_token_meter(self, gotokens):
+        if not isinstance(gotokens, dict):
+            self._tokens_caption.setVisible(False)
+            self._tokens_meter.setVisible(False)
+            return 0
+
+        balance = format_tokens(gotokens.get("balance"))
+        if balance is None:
+            self._tokens_caption.setVisible(False)
+            self._tokens_meter.setVisible(False)
+            return 0
+
+        allowance = format_tokens(gotokens.get("monthly_allowance"))
+        overdrawn = bool(gotokens.get("is_overdrawn"))
+        if allowance and allowance != "0":
+            self._tokens_caption.setText(
+                f"{balance} of {allowance} tokens")
+        else:
+            # No allowance to measure against (a top-up-only account): the
+            # figure is still worth showing, the bar is not.
+            self._tokens_caption.setText(f"{balance} tokens")
+        self._tokens_caption.setVisible(True)
+
+        fraction = _fraction(gotokens.get("balance"),
+                             gotokens.get("monthly_allowance"))
+        if fraction is None:
+            self._tokens_meter.setVisible(False)
+        else:
+            self._tokens_meter.setValue(int(round(fraction * 1000)))
+            self._tokens_meter.setStyleSheet(
+                design.meter_qss(tone="warn" if overdrawn else "accent"))
+            self._tokens_meter.setVisible(True)
+        return 1
+
+    def _set_storage_meter(self, storage):
+        if not isinstance(storage, dict):
+            # An older watcher has no storage counter at all. Saying nothing
+            # is right: the plan may well include storage we cannot measure.
+            self._storage_caption.setVisible(False)
+            self._storage_meter.setVisible(False)
+            return 0
+
+        used = storage.get("used_bytes")
+        if not isinstance(used, (int, float)):
+            self._storage_caption.setVisible(False)
+            self._storage_meter.setVisible(False)
+            return 0
+
+        if storage.get("unlimited"):
+            # No bar. A full bar and no limit at all must not look alike —
+            # the SaaS makes the same point in its own storage meter.
+            self._storage_caption.setText(
+                f"{format_bytes(used)} used of unlimited storage")
+            self._storage_caption.setVisible(True)
+            self._storage_meter.setVisible(False)
+            return 1
+
+        limit = storage.get("limit_bytes")
+        if not isinstance(limit, (int, float)) or limit <= 0:
+            self._storage_caption.setText(f"{format_bytes(used)} used")
+            self._storage_caption.setVisible(True)
+            self._storage_meter.setVisible(False)
+            return 1
+
+        self._storage_caption.setText(
+            f"{format_bytes(used)} of {format_bytes(limit)} used")
+        self._storage_caption.setVisible(True)
+        fraction = storage.get("fraction")
+        if not isinstance(fraction, (int, float)):
+            fraction = used / float(limit)
+        self._storage_meter.setValue(
+            int(round(max(0.0, min(1.0, fraction)) * 1000)))
+        self._storage_meter.setStyleSheet(design.meter_qss(
+            tone="warn" if storage.get("over") else "accent"))
+        self._storage_meter.setVisible(True)
+        return 1
+
+    # ── 3. Map & layers ───────────────────────────────────────────────────────
     def _build_layers(self):
         card = SectionCard("Map & layers", icon_name="layers")
         card.add(body_label(
@@ -523,7 +726,7 @@ class SettingsPage(QWidget):
 
         card.add_divider()
         card.add(body_label(
-            f"GoPilot for QGIS {PLUGIN_VERSION} · © 2026 RASID",
+            f"GoPilot for QGIS {plugin_version()} · © 2026 RASID",
             design.TEXT_XS, secondary=True,
         ))
         return card

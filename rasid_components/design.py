@@ -954,6 +954,30 @@ def body_qss(size=TEXT_MD, secondary=False):
     )
 
 
+def meter_qss(height=6, tone="accent"):
+    """A thin usage bar — `QProgressBar` with its text and groove restyled.
+
+    A QProgressBar rather than two nested frames because it already knows how
+    to resize its own fill; hand-rolled meters in a resizable dock need a
+    resizeEvent to stay honest, and one that forgets is a bar that lies.
+
+    ``tone="warn"`` for a meter at or over its limit, so being out of storage
+    does not look the same as having plenty.
+    """
+    t = tokens()
+    fill = {"accent": t.accent, "warn": t.error}.get(tone, t.accent)
+    return f"""
+        QProgressBar {{
+            background: {t.surface_sunken}; border: none;
+            border-radius: {height // 2}px; max-height: {height}px;
+            min-height: {height}px; text-align: center; color: transparent;
+        }}
+        QProgressBar::chunk {{
+            background: {fill}; border-radius: {height // 2}px;
+        }}
+    """
+
+
 def field_label_qss(size=TEXT_MD):
     """The label naming a form control.
 
