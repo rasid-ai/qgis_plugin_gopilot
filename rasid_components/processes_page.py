@@ -160,7 +160,10 @@ def _add_layer_to_qgis(filepath, layer_name):
         raise Exception(f"Could not load layer from {filepath}")
 
     QgsProject.instance().addMapLayer(layer, False)
-    target_group.addLayer(layer)
+    # insertLayer(0, …), not addLayer(…), for the reason given in
+    # `message_bubble.add_layer_to_qgis`: appending puts each new result
+    # underneath the ones already in the group.
+    target_group.insertLayer(0, layer)
 
 
 class ProcessesPage(QWidget):

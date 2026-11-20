@@ -127,7 +127,14 @@ def add_layer_to_qgis(filepath, layer_name, iface=None, sld=None):
         # addMapLayer(layer, False) keeps it out of the tree root so the group
         # can own it; adding it twice would show the layer in both places.
         project.addMapLayer(layer, False)
-        group.addLayer(layer)
+        # insertLayer(0, …), NOT addLayer(…): `addLayer` APPENDS, so every
+        # new result went to the bottom of the group and under everything
+        # already there — which for a result the user just asked for means
+        # hidden beneath the basemap and the previous answers. Measured:
+        # three appended layers come out oldest-first, while the ungrouped
+        # path (`addMapLayer` with the legend) already puts the newest on
+        # top. This makes the grouped path agree with it.
+        group.insertLayer(0, layer)
     else:
         project.addMapLayer(layer)
 

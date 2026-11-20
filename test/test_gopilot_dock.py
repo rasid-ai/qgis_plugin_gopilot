@@ -3208,6 +3208,103 @@ class DrawRestartTest(unittest.TestCase):
         self.assertNotIsInstance(self.canvas.mapTool(), ModernDrawTool)
 
 
+class LayerOrderTest(unittest.TestCase):
+    """A new result goes on TOP of what is already in the project.
+
+    `QgsLayerTreeGroup.addLayer` APPENDS, so every result landed at the
+    bottom of the group and underneath the previous answers — for something
+    the user has just asked for, that means hidden. Measured: three appended
+    layers come out oldest-first.
+
+    The ungrouped path was already right (`addMapLayer` with the legend puts
+    the newest on top), so only the grouped one was wrong — and grouping is
+    the default, so everyone saw it.
+    """
+
+    GEOJSON = ('{"type":"FeatureCollection","features":[{"type":"Feature",'
+               '"properties":{},"geometry":{"type":"Point",'
+               '"coordinates":[0,0]}}]}')
+
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.mkdtemp(prefix="order_")
+        self.path = os.path.join(self._dir, "p.geojson")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write(self.GEOJSON)
+        self._saved = (prefs.get_bool(prefs.LAYER_GROUP_ENABLED),
+                       prefs.get_bool(prefs.ZOOM_TO_LAYER))
+        prefs.set_value(prefs.ZOOM_TO_LAYER, False)
+        self._reset()
+
+    def tearDown(self):
+        self._reset()
+        prefs.set_value(prefs.LAYER_GROUP_ENABLED, self._saved[0])
+        prefs.set_value(prefs.ZOOM_TO_LAYER, self._saved[1])
+
+    def _reset(self):
+        from qgis.core import QgsProject
+        project = QgsProject.instance()
+        project.removeAllMapLayers()
+        root = project.layerTreeRoot()
+        for child in list(root.children()):
+            root.removeChildNode(child)
+
+    def _order(self, node):
+        """Names in tree order. Index 0 is the TOP of the layers panel."""
+        out = []
+        for child in node.children():
+            if hasattr(child, "layer"):
+                layer = child.layer()
+                out.append(layer.name() if layer else "?")
+            else:
+                out.append(f"[{child.name()}]")
+        return out
+
+    def test_chat_results_stack_newest_first_in_the_group(self):
+        from qgis.core import QgsProject
+        from rasid_components.message_bubble import add_layer_to_qgis
+        prefs.set_value(prefs.LAYER_GROUP_ENABLED, True)
+        for index in range(3):
+            add_layer_to_qgis(self.path, f"result-{index}", None)
+        group = QgsProject.instance().layerTreeRoot().findGroup(
+            prefs.get_str(prefs.LAYER_GROUP_NAME))
+        self.assertIsNotNone(group, "the results group was not created")
+        self.assertEqual(self._order(group),
+                         ["result-2", "result-1", "result-0"])
+
+    def test_chat_results_stack_newest_first_without_a_group(self):
+        """The path that was already correct; it must stay that way."""
+        from qgis.core import QgsProject
+        from rasid_components.message_bubble import add_layer_to_qgis
+        prefs.set_value(prefs.LAYER_GROUP_ENABLED, False)
+        for index in range(3):
+            add_layer_to_qgis(self.path, f"plain-{index}", None)
+        self.assertEqual(self._order(QgsProject.instance().layerTreeRoot()),
+                         ["plain-2", "plain-1", "plain-0"])
+
+    def test_process_results_stack_newest_first(self):
+        from qgis.core import QgsProject
+        from rasid_components.processes_page import _add_layer_to_qgis
+        for index in range(3):
+            _add_layer_to_qgis(self.path, f"process-{index}")
+        group = QgsProject.instance().layerTreeRoot().findGroup("GoBox")
+        self.assertIsNotNone(group)
+        self.assertEqual(self._order(group),
+                         ["process-2", "process-1", "process-0"])
+
+    def test_the_results_group_sits_above_the_users_own_layers(self):
+        """A result must not arrive underneath the basemap either."""
+        from qgis.core import QgsProject, QgsVectorLayer
+        from rasid_components.message_bubble import add_layer_to_qgis
+        prefs.set_value(prefs.LAYER_GROUP_ENABLED, True)
+        own = QgsVectorLayer(self.path, "the user's own layer", "ogr")
+        QgsProject.instance().addMapLayer(own)
+        add_layer_to_qgis(self.path, "new result", None)
+        order = self._order(QgsProject.instance().layerTreeRoot())
+        self.assertEqual(order[0], f"[{prefs.get_str(prefs.LAYER_GROUP_NAME)}]",
+                         f"the group is not on top: {order}")
+
+
 class OpeningAChatScrollsToTheEndTest(unittest.TestCase):
     """A conversation opens at its newest message, not its oldest.
 
