@@ -336,3 +336,93 @@ class GoPilotClient:
         )
         response.raise_for_status()
         return response.json()
+
+    # ========== PROMPT SUGGESTIONS ==========
+
+    def get_prompt_suggestions(
+        self, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """Starter prompts for an empty chat, as configured in the admin.
+
+        The same public endpoint the SaaS and its anonymous try-page use; the
+        server narrows the list by audience and picks at random, so two calls
+        return different handfuls. That is why the plugin draws ONCE per chat
+        and caches the result (see ``gopilot_page``) rather than refetching —
+        otherwise the cards would reshuffle under the user's cursor.
+
+        Each row is ``{id, title, prompt_text, description, icon, category}``.
+        ``title`` is what the card shows and ``prompt_text`` what gets sent:
+        deliberately separate, so a short label can stand for a long
+        instruction.
+        """
+        params = {"limit": limit} if limit else None
+        response = self.session.get(
+            self.base_url + "prompt-suggestions/",
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        # DRF may or may not paginate this one depending on deployment, so
+        # accept both a bare list and a {results: [...]} envelope rather than
+        # crashing the empty state on a config difference.
+        if isinstance(payload, dict):
+            payload = payload.get("results", [])
+        return payload if isinstance(payload, list) else []
+
+    # ========== TRASH, RENAME, LIMITS ==========
+
+    def hide_message(self, message_id: int) -> Dict[str, Any]:
+        """Move one exchange to the trash.
+
+        The backend takes the whole TURN — a prompt and its reply travel
+        together — so this is called with either id and both rows move. The
+        response reports which ones actually did, in ``trashed_ids``.
+
+        Hidden, not deleted: the SaaS exposes restore and permanent-delete on
+        the same rows, so this is reversible server-side even though the plugin
+        offers no UI for it yet.
+        """
+        response = self.session.post(
+            self.base_url + f"messages/{message_id}/hide/",
+            json={},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json() if response.content else {}
+
+    def update_session(self, session_id: int, title: Optional[str] = None,
+                       is_active: Optional[bool] = None) -> Dict[str, Any]:
+        """Rename a chat, or set its active flag.
+
+        A PATCH, so only the fields passed are sent — sending ``title=None``
+        would otherwise blank a title the caller never meant to touch.
+        """
+        payload: Dict[str, Any] = {}
+        if title is not None:
+            payload["title"] = title
+        if is_active is not None:
+            payload["is_active"] = is_active
+        response = self.session.patch(
+            self.base_url + f"sessions/{session_id}/",
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        return response.json() if response.content else {}
+
+    def get_upload_limits(self) -> Dict[str, Any]:
+        """What may be uploaded, and how large each kind may be.
+
+        ``{accept, extensions, kinds: {kind: {extensions, max_bytes,
+        mappable}}}``. The server is the only place this list is correct — the
+        plugin used to send whatever the user picked and let the upload fail
+        with whatever message the backend chose.
+        """
+        response = self.session.get(
+            self.base_url + "upload-limits/",
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
