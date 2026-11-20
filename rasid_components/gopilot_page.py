@@ -331,6 +331,33 @@ class GoPilotPage(QWidget):
         root.setSpacing(0)
 
         self._scroll = styled_scroll_area()
+
+        # STAYING AT THE BOTTOM WHILE THE TRANSCRIPT IS STILL GROWING.
+        #
+        # One deferred scroll is not enough to land at the end of a loaded
+        # chat. Every bubble's wrapped labels pin their own heights from
+        # their resizeEvent, each scheduling another layout pass, so the
+        # scroll maximum keeps rising for several turns of the event loop
+        # after the widgets are inserted. A scroll issued before that
+        # settles jumps to a maximum that is about to be wrong: measured on
+        # a 30-turn chat, it landed 3512px down a range that finished at
+        # 9542px — 37% of the way in, which is what "it opens at the start"
+        # looked like.
+        #
+        # So instead of guessing when the layout has finished, this follows
+        # the range: while `_stick_to_bottom` is set, every change to the
+        # scroll range re-pins the view to the end.
+        self._stick_to_bottom = False
+        self._stick_timer = QTimer(self)
+        self._stick_timer.setSingleShot(True)
+        self._stick_timer.timeout.connect(self._release_bottom)
+        bar = self._scroll.verticalScrollBar()
+        bar.rangeChanged.connect(self._on_scroll_range_changed)
+        # Any deliberate scroll by the user wins immediately — the pin must
+        # never fight someone reading back through the conversation.
+        bar.sliderPressed.connect(self._release_bottom)
+        bar.actionTriggered.connect(self._release_bottom)
+
         self._transcript = QWidget()
         paint_transparent(self._transcript)
         self._messages = QVBoxLayout(self._transcript)
@@ -537,6 +564,37 @@ class GoPilotPage(QWidget):
     def _scroll_to_bottom(self):
         bar = self._scroll.verticalScrollBar()
         bar.setValue(bar.maximum())
+
+    def jump_to_end(self):
+        """Go to the end of the transcript, and STAY there while it settles.
+
+        Used when a whole conversation appears at once — opening one from
+        History, or a reload after a delete. A single scroll cannot do this
+        reliably; see the note where `_stick_to_bottom` is declared.
+
+        The pin releases itself: on a timer, so it can never be permanent,
+        and on the first scroll the user makes.
+        """
+        self._stick_to_bottom = True
+        # Long enough for the layout passes a long chat needs, short enough
+        # that it cannot interfere with anything the user does next.
+        self._stick_timer.start(1500)
+        self._scroll_to_bottom()
+
+    def _release_bottom(self, *_args):
+        self._stick_to_bottom = False
+        try:
+            self._stick_timer.stop()
+        except RuntimeError:
+            pass
+
+    def _on_scroll_range_changed(self, _minimum, maximum):
+        if not self._stick_to_bottom:
+            return
+        try:
+            self._scroll.verticalScrollBar().setValue(maximum)
+        except RuntimeError:
+            self._stick_to_bottom = False
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1201,6 +1259,11 @@ class GoPilotPage(QWidget):
                 files=message.get("files"),
             )
         self._set_status("", busy=False)
+        # A conversation opens at its END. The newest exchange is the one the
+        # user came back for; starting at the top of a long chat meant
+        # scrolling all the way down every time.
+        if messages:
+            self.jump_to_end()
 
     @staticmethod
     def _format_timestamp(raw):

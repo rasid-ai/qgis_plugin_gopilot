@@ -3208,6 +3208,120 @@ class DrawRestartTest(unittest.TestCase):
         self.assertNotIsInstance(self.canvas.mapTool(), ModernDrawTool)
 
 
+class OpeningAChatScrollsToTheEndTest(unittest.TestCase):
+    """A conversation opens at its newest message, not its oldest.
+
+    One deferred scroll cannot do this. Every bubble's wrapped labels pin
+    their own heights from their resizeEvent, each scheduling another layout
+    pass, so the scroll maximum keeps rising for several turns of the event
+    loop after the widgets go in. A scroll issued before that settles jumps
+    to a maximum that is about to be wrong — measured on a 30-turn chat it
+    landed at 3512 of a range that finished at 9542, which is what "it opens
+    at the start" looked like.
+    """
+
+    LONG = ("A long wrapped answer, repeated so the transcript is taller "
+            "than the viewport and there is somewhere to scroll. ")
+
+    def setUp(self):
+        from rasid_components.gopilot_page import GoPilotPage
+        self.page = GoPilotPage(None, None)
+        self.page.resize(470, 620)
+        self.page.show()
+        for _ in range(25):
+            QGIS_APP.processEvents()
+        self.bar = self.page._scroll.verticalScrollBar()
+
+    def tearDown(self):
+        _destroy(self.page)
+        self.page = None
+
+    def _transcript(self, turns):
+        rows = []
+        for index in range(turns):
+            rows.append({"id": 100 + index * 2, "is_user": True,
+                         "content": f"question {index}"})
+            rows.append({"id": 101 + index * 2, "is_user": False,
+                         "content": f"answer {index}. " + self.LONG * 4})
+        return rows
+
+    def _settle(self, timeout_ms=1800):
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            QGIS_APP.processEvents()
+
+    def _load(self, turns):
+        self.page._on_messages_loaded(self._transcript(turns))
+        for _ in range(25):
+            QGIS_APP.processEvents()
+
+    def test_a_long_chat_opens_at_the_end(self):
+        self._load(30)
+        self.assertGreater(self.bar.maximum(), 0,
+                           "nothing to scroll; the test proves nothing")
+        self.assertGreaterEqual(
+            self.bar.value(), self.bar.maximum() - 2,
+            f"opened {self.bar.value()} of {self.bar.maximum()}")
+
+    def test_it_is_still_at_the_end_once_the_layout_settles(self):
+        """The range keeps growing after the load; the view must follow."""
+        self._load(30)
+        self._settle()
+        self.assertGreaterEqual(self.bar.value(), self.bar.maximum() - 2)
+
+    def test_a_short_chat_that_does_not_scroll_is_fine(self):
+        self._load(1)
+        self._settle(600)
+        self.assertEqual(self.bar.value(), self.bar.maximum())
+
+    def test_an_empty_chat_does_not_pin(self):
+        """Nothing was opened, so there is nothing to be at the end of."""
+        self.page._on_messages_loaded([])
+        for _ in range(12):
+            QGIS_APP.processEvents()
+        self.assertFalse(self.page._stick_to_bottom)
+
+    # ── the pin must never fight the user ───────────────────────────────────
+    def test_a_user_scroll_releases_the_pin(self):
+        self._load(20)
+        self.page.jump_to_end()
+        for _ in range(5):
+            QGIS_APP.processEvents()
+        self.assertTrue(self.page._stick_to_bottom)
+        # What a wheel scroll does to a scrollbar.
+        self.bar.actionTriggered.emit(1)
+        for _ in range(5):
+            QGIS_APP.processEvents()
+        self.assertFalse(self.page._stick_to_bottom,
+                         "the view would keep yanking back to the bottom")
+
+    def test_dragging_the_scrollbar_releases_the_pin(self):
+        self._load(20)
+        self.page.jump_to_end()
+        self.bar.sliderPressed.emit()
+        for _ in range(5):
+            QGIS_APP.processEvents()
+        self.assertFalse(self.page._stick_to_bottom)
+
+    def test_the_pin_expires_on_its_own(self):
+        """Bounded, so it can never become permanent behaviour."""
+        self._load(20)
+        self.page.jump_to_end()
+        self.assertTrue(self.page._stick_to_bottom)
+        self._settle(1800)
+        self.assertFalse(self.page._stick_to_bottom)
+
+    def test_a_released_pin_ignores_the_range_growing(self):
+        self._load(20)
+        self.page._release_bottom()
+        self.bar.setValue(0)
+        for _ in range(8):
+            QGIS_APP.processEvents()
+        self.page._on_scroll_range_changed(0, self.bar.maximum())
+        self.assertEqual(self.bar.value(), 0,
+                         "a released pin still moved the view")
+
+
 class DownloadButtonTest(unittest.TestCase):
     """The download control, which used to be a one-way trip.
 
