@@ -3208,6 +3208,605 @@ class DrawRestartTest(unittest.TestCase):
         self.assertNotIsInstance(self.canvas.mapTool(), ModernDrawTool)
 
 
+class StyledTilesTest(unittest.TestCase):
+    """Show a raster the way the website shows it: the styled pyramid.
+
+    There is no style document for a raster result and there never was. The
+    colour is applied SERVER-SIDE while the tile pyramid is built, and the
+    website displays that finished pyramid — so no style is sent, `sld` is
+    null, and `symbology`/`style_config` are declared in the web's schema
+    but read by no line of it.
+
+    The plugin downloads the raw GeoTIFF instead, which QGIS renders with
+    its own grey stretch. That is the whole of "my NDVI is grey": not a
+    styling bug, a different source. Loading the same pyramid gives the
+    server's own colouring with nothing translated.
+
+    NOTE: building an actual XYZ layer needs QGIS's `wms` provider library,
+    which this harness does not load (a bare QApplication gets ogr and gdal
+    only). So the URL and URI construction, and the readiness rules, are
+    asserted here; the layer really being created is verified by probe.
+    """
+
+    URL = "https://api.rasid.ai/api/llm/files/8080/download/"
+    READY = {"id": 8080, "name": "ndvi_20261120.tif", "file_type": "raster",
+             "file_url": URL, "sld": None,
+             "tiles_path": "/media/tiles/8080", "tiles_situation": "gs",
+             "processing_status": "completed",
+             "bbox": [35.5056, 33.8663, 35.5140, 33.8758]}
+
+    # ── readiness, matching the website's own test ──────────────────────────
+    def test_a_built_pyramid_is_ready(self):
+        from rasid_components.tiles import tiles_ready
+        self.assertTrue(tiles_ready(self.READY))
+
+    def test_a_pyramid_still_building_is_not_offered(self):
+        """'g' is gdal2tiles still running, 'gf' that it failed.
+
+        Offering the control then would give the user a button that fetches
+        404s.
+        """
+        from rasid_components.tiles import tiles_ready
+        for situation in ("g", "gf"):
+            self.assertFalse(
+                tiles_ready(dict(self.READY, tiles_situation=situation)),
+                situation)
+
+    def test_a_file_with_no_pyramid_is_not_offered(self):
+        from rasid_components.tiles import tiles_ready
+        self.assertFalse(tiles_ready(dict(self.READY, tiles_path=None)))
+
+    def test_the_models_download_only_verdict_is_respected(self):
+        from rasid_components.tiles import tiles_ready
+        self.assertFalse(tiles_ready(dict(self.READY, visualization=False)))
+
+    def test_a_file_still_processing_is_not_offered(self):
+        from rasid_components.tiles import tiles_ready
+        self.assertFalse(
+            tiles_ready(dict(self.READY, processing_status="processing")))
+
+    def test_junk_is_not_ready(self):
+        from rasid_components.tiles import tiles_ready
+        for junk in (None, "", 42, [], {}):
+            self.assertFalse(tiles_ready(junk), repr(junk))
+
+    # ── the url, built the way the website builds it ────────────────────────
+    def test_the_url_asks_for_tms_rows(self):
+        """`{-y}`, not `{y}`.
+
+        gdal2tiles writes TMS unless asked for --xyz, and this backend does
+        not ask. Measured against the live pyramid: XYZ rows return 404 at
+        every one of its 15 zoom levels, inverted rows return a real PNG at
+        every one.
+
+        For a pyramid covering one AoI this is not the vertical mirror the
+        convention is known for — the flipped row falls outside the data, so
+        every tile 404s and the layer draws nothing at all.
+        """
+        from rasid_components.tiles import tiles_template
+        self.assertEqual(
+            tiles_template(self.READY, origin="https://api.rasid.ai"),
+            "https://api.rasid.ai/media/tiles/8080/{z}/{x}/{-y}.png")
+
+    def test_xyz_rows_remain_available(self):
+        """In case a deployment ever passes --xyz."""
+        from rasid_components.tiles import tiles_template
+        self.assertEqual(
+            tiles_template(self.READY, origin="https://api.rasid.ai",
+                           tms=False),
+            "https://api.rasid.ai/media/tiles/8080/{z}/{x}/{y}.png")
+
+    def test_a_trailing_or_missing_slash_is_tolerated(self):
+        from rasid_components.tiles import tiles_template
+        expected = "https://x/media/tiles/8080/{z}/{x}/{-y}.png"
+        for path in ("/media/tiles/8080", "/media/tiles/8080/",
+                     "media/tiles/8080"):
+            self.assertEqual(
+                tiles_template(dict(self.READY, tiles_path=path),
+                               origin="https://x/"),
+                expected, path)
+
+    def test_an_unready_file_has_no_url(self):
+        from rasid_components.tiles import tiles_template
+        self.assertIsNone(
+            tiles_template(dict(self.READY, tiles_situation="g")))
+
+    # ── the provider uri ────────────────────────────────────────────────────
+    def test_the_uri_is_an_xyz_layer(self):
+        from rasid_components.tiles import tiles_template, tiles_uri
+        uri = tiles_uri(tiles_template(self.READY))
+        self.assertIn("type=xyz", uri)
+        self.assertIn("zmin=", uri)
+        self.assertIn("zmax=", uri)
+        # The braces need encoding; nothing else does. See the round-trip
+        # test below for why that distinction decides whether anything draws.
+        self.assertIn("%7Bz%7D", uri)
+
+    def test_there_is_no_such_thing_as_type_tms(self):
+        """QGIS has no `type=tms`; it rejects the URI outright.
+
+        Inverted rows are spelled with the `{-y}` placeholder instead. This
+        test exists because `type=tms` reads so plausibly that it was
+        written, shipped, and only caught by asking QGIS to build the layer.
+        """
+        from rasid_components.tiles import tiles_template, tiles_uri
+        self.assertNotIn("type=tms", tiles_uri(tiles_template(self.READY)))
+
+    def test_the_uri_survives_the_providers_own_parse(self):
+        """The regression that made every tile request go nowhere.
+
+        The URI used to be assembled by hand with `quote(url, safe="")`,
+        which percent-encodes the WHOLE template. The provider hands that
+        back as a literal `https%3A%2F%2F…`, so the layer loads, reports
+        itself valid, appears in the tree, and fetches nothing — the exact
+        symptom the user reported, and the reason a public basemap built the
+        same way also drew nothing.
+
+        `setEncodedUri` is the reader `QgsWmsSettings::parseUri` uses, so
+        this asserts against the parser that actually matters. Note that
+        `QgsDataSourceUri(string)` — the constructor — does NOT read these
+        parameters, which wasted a round of diagnosis.
+        """
+        from qgis.core import QgsDataSourceUri
+        from rasid_components.tiles import tiles_template, tiles_uri
+
+        template = tiles_template(self.READY, origin="https://api.rasid.ai")
+        uri = QgsDataSourceUri()
+        uri.setEncodedUri(tiles_uri(template, api_key="SECRET", zmax=14))
+
+        self.assertEqual(uri.param("url"), template)
+        self.assertEqual(uri.param("type"), "xyz")
+        self.assertEqual(uri.param("zmax"), "14")
+        self.assertEqual(str(uri.httpHeaders()["Authorization"]),
+                         "Bearer SECRET")
+
+    # ── the zoom range, from the pyramid rather than invented ───────────────
+    #: An abridged copy of a real `tilemapresource.xml`, including gdal2tiles'
+    #: habit of declaring EPSG:3857 and then writing degrees.
+    METADATA = """<?xml version="1.0" encoding="utf-8"?>
+        <TileMap version="1.0.0" tilemapservice="http://tms.osgeo.org/1.0.0">
+          <Title>tmp9c8hhgve.tif</Title>
+          <SRS>EPSG:3857</SRS>
+          <BoundingBox minx="39.99738905000312" miny="29.79757024858759"
+ maxx="40.41226267999826" maxy="30.15927434659142"/>
+          <TileFormat width="256" height="256" mime-type="image/png"
+ extension="png"/>
+          <TileSets profile="mercator">
+            <TileSet href="0" units-per-pixel="156543.0339" order="0"/>
+            <TileSet href="13" units-per-pixel="19.109257" order="13"/>
+            <TileSet href="14" units-per-pixel="9.554628" order="14"/>
+          </TileSets>
+        </TileMap>"""
+
+    def test_the_zoom_range_is_read_from_the_pyramid(self):
+        from rasid_components.tiles import parse_metadata
+        meta = parse_metadata(self.METADATA)
+        self.assertEqual(meta["zmin"], 0)
+        self.assertEqual(meta["zmax"], 14)
+
+    def test_the_extent_is_read_from_the_pyramid(self):
+        """Because `bbox` on the file record is frequently null."""
+        from rasid_components.tiles import parse_metadata
+        bbox = parse_metadata(self.METADATA)["bbox"]
+        self.assertEqual(len(bbox), 4)
+        self.assertAlmostEqual(bbox[0], 39.99738905, places=6)
+        self.assertAlmostEqual(bbox[3], 30.15927435, places=6)
+
+    def test_the_zoom_range_reaches_the_uri(self):
+        from rasid_components.tiles import parse_metadata, tiles_uri
+        meta = parse_metadata(self.METADATA)
+        uri = tiles_uri("https://api.rasid.ai/t/{z}/{x}/{-y}.png",
+                        zmin=meta["zmin"], zmax=meta["zmax"])
+        self.assertIn("zmax=14", uri)
+
+    def test_an_overstated_zoom_range_is_the_damaging_direction(self):
+        """So the fallback is conservative, not generous.
+
+        Claim a level the pyramid does not have and QGIS asks for it and
+        draws blank. Understate it and QGIS scales the deepest real tile:
+        soft, but visible. The fallback therefore sits well below any
+        plausible real maximum.
+        """
+        from rasid_components.tiles import ZOOM_MAX_FALLBACK, tiles_uri
+        self.assertLessEqual(ZOOM_MAX_FALLBACK, 18)
+        self.assertIn(f"zmax={ZOOM_MAX_FALLBACK}",
+                      tiles_uri("https://api.rasid.ai/t/{z}/{x}/{-y}.png"))
+
+    def test_unreadable_metadata_costs_the_framing_not_the_layer(self):
+        """A metadata hiccup must never lose the user their layer."""
+        from rasid_components.tiles import read_metadata
+
+        class Exploding:
+            class session:
+                @staticmethod
+                def get(*_args, **_kwargs):
+                    raise OSError("the network is on fire")
+
+        self.assertEqual(
+            read_metadata("https://api.rasid.ai/t/tilemapresource.xml",
+                          api_key="SECRET", client=Exploding()), {})
+
+    def test_junk_metadata_yields_nothing_rather_than_guesses(self):
+        from rasid_components.tiles import parse_metadata
+        for junk in (None, "", "<html>404</html>", "not xml at all"):
+            self.assertEqual(parse_metadata(junk), {}, repr(junk))
+
+    def test_the_metadata_token_is_withheld_from_third_party_hosts(self):
+        """The same allowlist as the tiles themselves."""
+        from rasid_components.tiles import read_metadata
+
+        seen = {}
+
+        class Recording:
+            class session:
+                @staticmethod
+                def get(url, headers=None, timeout=None):
+                    seen["headers"] = headers or {}
+                    raise OSError("stop here; the headers are the point")
+
+        read_metadata("https://cdn.elsewhere.net/t/tilemapresource.xml",
+                      api_key="SECRET", client=Recording())
+        self.assertNotIn("Authorization", seen["headers"])
+
+    def test_the_origin_comes_from_the_live_client(self):
+        """Not from `config.API_HOST`, which is a build-time default.
+
+        Precautionary, not a fix for anything observed: on the deployment
+        measured, the client's own base URL and `API_HOST` agree, so the
+        wrong origin was NOT what made the tiles invisible — see the
+        round-trip and TMS tests for what was. Following the live client
+        still costs nothing and keeps the tiles on whatever host the session
+        is actually signed in to, where a wrong origin would 404 silently.
+        """
+        from rasid_components.tiles import origin_of
+
+        class Gopilot:
+            base_url = "https://beta.api.rasid.ai/api/llm/"
+
+        class Client:
+            base_url = "https://beta.api.rasid.ai/api/"
+            gopilot = Gopilot()
+
+        self.assertEqual(origin_of(Client()), "https://beta.api.rasid.ai")
+
+    def test_the_origin_falls_back_when_the_client_knows_nothing(self):
+        from rasid_components.config import API_HOST
+        from rasid_components.tiles import origin_of
+
+        class Bare:
+            pass
+
+        self.assertEqual(origin_of(Bare()), API_HOST)
+
+    def test_an_absolute_tiles_path_is_used_as_it_stands(self):
+        """Prepending an origin to a full URL would corrupt it."""
+        from rasid_components.tiles import tiles_template
+        url = tiles_template(dict(self.READY,
+                                  tiles_path="https://cdn.example/t/9"),
+                             origin="https://ignored.example")
+        self.assertEqual(url, "https://cdn.example/t/9/{z}/{x}/{-y}.png")
+
+    def test_the_token_goes_to_our_own_hosts(self):
+        """The pyramid is not public: anonymous requests get 403."""
+        from rasid_components.tiles import tiles_template, tiles_uri
+        uri = tiles_uri(tiles_template(self.READY), api_key="SECRET")
+        self.assertIn("http-header:Authorization", uri)
+        self.assertIn("SECRET", uri)
+
+    def test_the_token_is_withheld_from_third_party_hosts(self):
+        """A pyramid on someone else's storage must not get credentials."""
+        from rasid_components.tiles import tiles_uri
+        uri = tiles_uri("https://cdn.elsewhere.net/t/{z}/{x}/{-y}.png",
+                        api_key="SECRET")
+        self.assertNotIn("Authorization", uri)
+        self.assertNotIn("SECRET", uri)
+
+    # ── the control on the bubble ───────────────────────────────────────────
+    def _bubble(self, entry):
+        from rasid_components.message_bubble import MessageBubble
+
+        class Client:
+            api_key = "SECRET"
+
+        bubble = MessageBubble(
+            f"result [ndvi_20261120.tif]({self.URL})", role="ai",
+            client=Client(), message_id=7,
+            files=[entry] if entry else [])
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        self.addCleanup(_destroy, bubble)
+        self.addCleanup(bubble.cleanup)
+        return bubble
+
+    def _buttons(self, bubble):
+        out = []
+        for index in range(bubble._results_layout.count()):
+            widget = bubble._results_layout.itemAt(index).widget()
+            if isinstance(widget, QPushButton):
+                out.append(widget.text().strip())
+        return out
+
+    def test_a_ready_raster_offers_both_the_data_and_the_view(self):
+        """Two controls, because they answer different questions.
+
+        The GeoTIFF is the data — queryable, analysable. The pyramid is the
+        picture. Neither substitutes for the other.
+        """
+        texts = self._buttons(self._bubble(self.READY))
+        self.assertEqual(len(texts), 2, texts)
+        self.assertIn("ndvi_20261120.tif", texts[0])
+        self.assertIn("styled view", texts[1])
+
+    def test_an_unready_raster_offers_only_the_file(self):
+        texts = self._buttons(
+            self._bubble(dict(self.READY, tiles_situation="g")))
+        self.assertEqual(len(texts), 1, texts)
+
+    def test_a_result_with_no_file_record_offers_only_the_file(self):
+        """Messages from before the file list was plumbed through."""
+        texts = self._buttons(self._bubble(None))
+        self.assertEqual(len(texts), 1, texts)
+
+    def test_the_styled_view_does_not_download_anything(self):
+        """QGIS fetches the tiles itself; there is nothing for us to get."""
+        bubble = self._bubble(self.READY)
+        styled = [c for c in bubble._downloads
+                  if "styled" in c._idle_text]
+        self.assertEqual(len(styled), 1)
+        self.assertFalse(styled[0]._needs_download)
+
+    def test_the_busy_label_paints_before_the_work_starts(self):
+        """Adding tiles blocks on the network, so the label must land first.
+
+        Nothing is downloaded, but the layer still cannot be built without
+        reading the pyramid's `tilemapresource.xml` for its zoom range and
+        extent. Done inline, that holds the UI on the OLD label for the
+        duration — a click that appears to do nothing. So the work is
+        deferred by one event-loop turn: after the click the button must
+        already read "Adding…" with the layer not yet attempted.
+        """
+        bubble = self._bubble(self.READY)
+        controller = [c for c in bubble._downloads
+                      if "styled" in c._idle_text][0]
+
+        attempts = []
+        controller._add_layer = lambda path: attempts.append(path)
+
+        controller.button.click()
+        self.assertIn("Adding", controller.button.text())
+        self.assertEqual(attempts, [], "the work ran before the repaint")
+
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        self.assertEqual(attempts, [None], "the work never ran")
+
+    def test_a_bubble_torn_down_mid_turn_is_not_touched(self):
+        """The deferred turn is long enough for the page to go away."""
+        bubble = self._bubble(self.READY)
+        controller = [c for c in bubble._downloads
+                      if "styled" in c._idle_text][0]
+        attempts = []
+        controller._add_layer = lambda path: attempts.append(path)
+
+        controller.button.click()
+        controller.cleanup()                 # the user leaves the page
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        self.assertEqual(attempts, [])
+
+
+class RasterStylingTest(unittest.TestCase):
+    """Raster results get their colour map, by translating it ourselves.
+
+    QGIS refuses SLD on a raster outright — measured on 3.36.3 and 4.0.1,
+    with a georeferenced raster and a real RasterSymbolizer, it answers
+    "Layer type 1 not supported". That is a refusal by layer type, not a
+    complaint about the document, so the ColorMap has to be read out of the
+    XML and rebuilt as a QgsSingleBandPseudoColorRenderer.
+
+    The website never hits this because raster results reach it as
+    pre-rendered tiles with the colouring baked in. The plugin downloads the
+    raw GeoTIFF, so without this it shows QGIS's default grey stretch where
+    the website shows a ramp.
+    """
+
+    NDVI_SLD = """<?xml version="1.0" encoding="UTF-8"?>
+<StyledLayerDescriptor version="1.0.0" xmlns="http://www.opengis.net/sld">
+  <NamedLayer><Name>ndvi</Name><UserStyle><FeatureTypeStyle><Rule>
+    <RasterSymbolizer>
+      <Opacity>0.85</Opacity>
+      <ColorMap type="ramp">
+        <ColorMapEntry color="#A50026" quantity="-0.2" label="bare"/>
+        <ColorMapEntry color="#FFFFBF" quantity="0.35" label="sparse"/>
+        <ColorMapEntry color="#006837" quantity="0.9" label="dense"/>
+      </ColorMap>
+    </RasterSymbolizer>
+  </Rule></FeatureTypeStyle></UserStyle></NamedLayer>
+</StyledLayerDescriptor>"""
+
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.mkdtemp(prefix="rsld_")
+        self._made = {}
+
+    def _raster(self, name, bands=1):
+        """A real georeferenced GeoTIFF; GDAL is always present in QGIS."""
+        if name in self._made:
+            return self._made[name]
+        import numpy
+        from osgeo import gdal, osr
+        gdal.UseExceptions()
+        path = os.path.join(self._dir, name)
+        dtype = gdal.GDT_Float32 if bands == 1 else gdal.GDT_Byte
+        dataset = gdal.GetDriverByName("GTiff").Create(
+            path, 8, 8, bands, dtype)
+        dataset.SetGeoTransform([31.0, 0.001, 0.0, 30.0, 0.0, -0.001])
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(4326)
+        dataset.SetProjection(srs.ExportToWkt())
+        values = numpy.linspace(-0.2, 0.9, 64).reshape(8, 8)
+        for index in range(1, bands + 1):
+            dataset.GetRasterBand(index).WriteArray(
+                values.astype("float32") if bands == 1
+                else (values * 100).astype("uint8"))
+        dataset.FlushCache()
+        dataset = None
+        self._made[name] = path
+        return path
+
+    def _styled(self, name, sld, bands=1):
+        from qgis.core import QgsRasterLayer
+        from rasid_components.layer_style import apply_sld
+        layer = QgsRasterLayer(self._raster(name, bands), name)
+        self.assertTrue(layer.isValid(), f"{name} did not open")
+        return layer, apply_sld(layer, sld)
+
+    def _stops(self, layer):
+        shader = layer.renderer().shader().rasterShaderFunction()
+        return [(round(item.value, 3), item.color.name().lower(), item.label)
+                for item in shader.colorRampItemList()]
+
+    def test_a_single_band_raster_gets_the_colour_map(self):
+        from qgis.core import QgsSingleBandPseudoColorRenderer
+        layer, applied = self._styled("ndvi.tif", self.NDVI_SLD)
+        self.assertTrue(applied)
+        self.assertIsInstance(layer.renderer(),
+                              QgsSingleBandPseudoColorRenderer)
+
+    def test_the_stops_match_the_document(self):
+        layer, _ = self._styled("ndvi2.tif", self.NDVI_SLD)
+        self.assertEqual(self._stops(layer),
+                         [(-0.2, "#a50026", "bare"),
+                          (0.35, "#ffffbf", "sparse"),
+                          (0.9, "#006837", "dense")])
+
+    def test_the_opacity_is_honoured(self):
+        layer, _ = self._styled("ndvi3.tif", self.NDVI_SLD)
+        self.assertAlmostEqual(layer.renderer().opacity(), 0.85, places=3)
+
+    def test_the_colour_map_type_chooses_the_interpolation(self):
+        """ramp -> Interpolated, intervals -> Discrete, values -> Exact."""
+        from qgis.core import QgsColorRampShader
+
+        def kind(name):
+            value = getattr(QgsColorRampShader, name, None)
+            return value if value is not None else getattr(
+                QgsColorRampShader.Type, name)
+
+        for sld_type, expected in (("ramp", "Interpolated"),
+                                   ("intervals", "Discrete"),
+                                   ("values", "Exact")):
+            sld = self.NDVI_SLD.replace('type="ramp"', f'type="{sld_type}"')
+            layer, applied = self._styled(f"t_{sld_type}.tif", sld)
+            self.assertTrue(applied, sld_type)
+            self.assertEqual(
+                layer.renderer().shader().rasterShaderFunction()
+                .colorRampType(), kind(expected), sld_type)
+
+    def test_a_prefixed_document_is_read_too(self):
+        """SLD arrives default-namespaced or "sld:" prefixed."""
+        prefixed = """<?xml version="1.0"?>
+<sld:StyledLayerDescriptor version="1.0.0"
+    xmlns:sld="http://www.opengis.net/sld">
+  <sld:NamedLayer><sld:Name>c</sld:Name><sld:UserStyle>
+  <sld:FeatureTypeStyle><sld:Rule><sld:RasterSymbolizer>
+    <sld:ColorMap>
+      <sld:ColorMapEntry color="#0000FF" quantity="0"/>
+      <sld:ColorMapEntry color="#FF0000" quantity="1"/>
+    </sld:ColorMap>
+  </sld:RasterSymbolizer></sld:Rule>
+  </sld:FeatureTypeStyle></sld:UserStyle></sld:NamedLayer>
+</sld:StyledLayerDescriptor>"""
+        layer, applied = self._styled("pref.tif", prefixed)
+        self.assertTrue(applied)
+        self.assertEqual([s[0] for s in self._stops(layer)], [0.0, 1.0])
+
+    def test_per_entry_opacity_becomes_the_stop_alpha(self):
+        """QGIS has no separate alpha on a ramp stop; it is in the colour."""
+        sld = self.NDVI_SLD.replace(
+            '<ColorMapEntry color="#A50026" quantity="-0.2" label="bare"/>',
+            '<ColorMapEntry color="#A50026" quantity="-0.2" label="bare"'
+            ' opacity="0.5"/>')
+        layer, _ = self._styled("alpha.tif", sld)
+        shader = layer.renderer().shader().rasterShaderFunction()
+        first = shader.colorRampItemList()[0]
+        self.assertLess(first.color.alpha(), 200,
+                        "the entry's opacity was dropped")
+
+    def test_the_stops_are_sorted(self):
+        """QGIS expects ascending values; an SLD need not provide them so."""
+        shuffled = """<?xml version="1.0"?>
+<StyledLayerDescriptor version="1.0.0" xmlns="http://www.opengis.net/sld">
+  <NamedLayer><Name>s</Name><UserStyle><FeatureTypeStyle><Rule>
+    <RasterSymbolizer><ColorMap>
+      <ColorMapEntry color="#006837" quantity="0.9"/>
+      <ColorMapEntry color="#A50026" quantity="-0.2"/>
+      <ColorMapEntry color="#FFFFBF" quantity="0.35"/>
+    </ColorMap></RasterSymbolizer>
+  </Rule></FeatureTypeStyle></UserStyle></NamedLayer>
+</StyledLayerDescriptor>"""
+        layer, _ = self._styled("sorted.tif", shuffled)
+        values = [stop[0] for stop in self._stops(layer)]
+        self.assertEqual(values, sorted(values))
+
+    def test_a_named_band_is_honoured(self):
+        sld = self.NDVI_SLD.replace(
+            "<RasterSymbolizer>",
+            "<RasterSymbolizer><ChannelSelection><GrayChannel>"
+            "<SourceChannelName>2</SourceChannelName>"
+            "</GrayChannel></ChannelSelection>")
+        layer, applied = self._styled("banded.tif", sld, bands=3)
+        self.assertTrue(applied)
+        self.assertEqual(layer.renderer().band(), 2)
+
+    # ── the guards ──────────────────────────────────────────────────────────
+    def test_an_rgb_raster_is_left_alone(self):
+        """The one that matters most.
+
+        A ColorMap colours ONE band. Applying it to band 1 of an
+        already-classified RGB result would replace a correct three-channel
+        rendering with a single-channel ramp — so without a named band, a
+        multi-band raster keeps what QGIS gave it.
+        """
+        from qgis.core import QgsMultiBandColorRenderer
+        layer, applied = self._styled("rgb.tif", self.NDVI_SLD, bands=3)
+        self.assertFalse(applied)
+        self.assertIsInstance(layer.renderer(), QgsMultiBandColorRenderer)
+
+    def test_a_band_the_raster_does_not_have_is_refused(self):
+        sld = self.NDVI_SLD.replace(
+            "<RasterSymbolizer>",
+            "<RasterSymbolizer><ChannelSelection><GrayChannel>"
+            "<SourceChannelName>9</SourceChannelName>"
+            "</GrayChannel></ChannelSelection>")
+        layer, applied = self._styled("badband.tif", sld)
+        self.assertFalse(applied)
+
+    def test_a_symbolizer_with_no_colour_map_is_left_alone(self):
+        sld = """<?xml version="1.0"?>
+<StyledLayerDescriptor version="1.0.0" xmlns="http://www.opengis.net/sld">
+  <NamedLayer><Name>n</Name><UserStyle><FeatureTypeStyle><Rule>
+    <RasterSymbolizer><Opacity>0.5</Opacity></RasterSymbolizer>
+  </Rule></FeatureTypeStyle></UserStyle></NamedLayer>
+</StyledLayerDescriptor>"""
+        layer, applied = self._styled("nomap.tif", sld)
+        self.assertFalse(applied)
+
+    def test_entries_with_unusable_values_are_dropped_not_fatal(self):
+        sld = self.NDVI_SLD.replace(
+            '<ColorMapEntry color="#FFFFBF" quantity="0.35" label="sparse"/>',
+            '<ColorMapEntry color="not-a-colour" quantity="0.5"/>'
+            '<ColorMapEntry color="#FFFFBF" quantity="nonsense"/>'
+            '<ColorMapEntry color="#FFFFBF" quantity="0.35" label="sparse"/>')
+        layer, applied = self._styled("junkentry.tif", sld)
+        self.assertTrue(applied)
+        self.assertEqual(len(self._stops(layer)), 3)
+
+    def test_unparseable_xml_is_not_fatal(self):
+        layer, applied = self._styled("broken.tif", "<StyledLayerDescriptor")
+        self.assertFalse(applied)
+
+
 class LayerOrderTest(unittest.TestCase):
     """A new result goes on TOP of what is already in the project.
 
@@ -3822,6 +4421,55 @@ class LayerStylingTest(unittest.TestCase):
         self.assertIsNone(bubble.style_for(
             "https://app.gopilot.earth/api/llm/files/9999/download/"))
 
+    def test_a_presigned_link_matches_on_the_file_name(self):
+        """Both URL matchers can miss, and then the style was dropped.
+
+        A result link in the message text can be a presigned storage URL:
+        no `/files/<id>/` segment to read an id from, and a different URL
+        from the `file_url` the payload carries for the same file. The style
+        then went unused and the layer arrived unstyled — for a raster, that
+        is QGIS's grey stretch where the website shows a colour ramp.
+        """
+        files = [{"id": 4242, "name": "ndvi_20261120.tif",
+                  "file_url": self.URL, "file_type": "raster",
+                  "sld": self.SLD}]
+        bubble = self._bubble(files)
+        presigned = "https://cdn.example/abc123/blob"
+        self.assertIsNone(bubble.style_for(presigned),
+                          "the url should not match; that is the premise")
+        self.assertEqual(bubble.style_for(presigned, "ndvi_20261120.tif"),
+                         self.SLD)
+
+    def test_the_name_match_is_exact_and_last(self):
+        """A weak key, so it must not fire on a near miss."""
+        files = [{"id": 1, "name": "ndvi_jan.tif", "file_url": "",
+                  "sld": self.SLD},
+                 {"id": 2, "name": "ndvi_jul.tif", "file_url": "",
+                  "sld": "<StyledLayerDescriptor>other</StyledLayerDescriptor>"}]
+        bubble = self._bubble(files)
+        self.assertEqual(bubble.style_for("", "ndvi_jan.tif"), self.SLD)
+        self.assertIsNone(bubble.style_for("", "ndvi.tif"))
+        self.assertIsNone(bubble.style_for("", "ndvi_jan"))
+
+    def test_an_id_in_the_url_still_wins_over_the_name(self):
+        """The strongest key first: two files, same name, different ids."""
+        files = [{"id": 11, "name": "same.tif", "file_url": "",
+                  "sld": "<StyledLayerDescriptor>eleven</StyledLayerDescriptor>"},
+                 {"id": 22, "name": "same.tif", "file_url": "",
+                  "sld": "<StyledLayerDescriptor>twenty2</StyledLayerDescriptor>"}]
+        bubble = self._bubble(files)
+        got = bubble.style_for(
+            "https://app.gopilot.earth/api/llm/files/22/download/", "same.tif")
+        self.assertIn("twenty2", got)
+
+    def test_the_download_passes_the_filename_to_the_lookup(self):
+        """Otherwise the name matcher can never fire in the real path."""
+        import os as _os
+        from rasid_components import message_bubble
+        source = _code_of(_os.path.abspath(message_bubble.__file__))
+        self.assertIn("self.style_for(u, f)", source,
+                      "the result button looks the style up by url alone")
+
     def test_no_file_list_is_not_an_error(self):
         """Messages predating this, and any message with no results."""
         bubble = self._bubble(None)
@@ -3972,14 +4620,8 @@ class LayerStylingTest(unittest.TestCase):
         self.assertTrue(apply_sld(
             layer, self._filtered_sld("size_class", ["largest"])))
 
-    def test_a_raster_is_skipped_rather_than_failing(self):
-        """QGIS refuses SLD on rasters — "Layer type 1 not supported".
-
-        Measured on 3.36.3 and 4.0.1 with a georeferenced raster and a real
-        RasterSymbolizer. Not a gap in this code: the website does not style
-        rasters either, it serves them as pre-rendered tiles with the
-        colouring already baked in.
-        """
+    def test_a_vector_style_on_a_raster_changes_nothing(self):
+        """A PolygonSymbolizer has nothing to say about a raster."""
         from rasid_components.layer_style import apply_sld
         from qgis.core import QgsRasterLayer
         layer = QgsRasterLayer(self.geojson, "notaraster")   # invalid is fine
@@ -4226,6 +4868,86 @@ class MessageIdReconcileTest(unittest.TestCase):
         page._reconcile_message_ids()
         self._settle(400)
         self.assertEqual(page.client.gopilot.calls, 0)
+
+    def test_a_live_turn_gets_its_file_list_from_the_server(self):
+        """The task payload has no `files`, and the style lives in it.
+
+        `llm_message` on a finished task carries the content, the reasoning
+        and the tool calls — but not the file list. So a bubble built from a
+        live turn had no files, and `style_for` had nothing to search: the
+        log said "No SLD was sent for 'ndvi_20261120'" while the website
+        showed the same raster styled. The style only appeared after
+        reopening the chat, which read the endpoint this reconcile reads.
+        """
+        URL = "https://app.gopilot.earth/api/llm/files/8080/download/"
+        TEXT = f"The GeoTIFF [ndvi.tif]({URL}) is on the map."
+        rows = [
+            {"id": 776, "is_user": True, "content": "ndvi please",
+             "files": []},
+            {"id": 777, "is_user": False, "content": TEXT,
+             "files": [{"id": 8080, "name": "ndvi.tif", "file_url": URL,
+                        "file_type": "raster", "sld": "<sld:Raster/>"}]},
+        ]
+        page = self._page(rows)
+        page.add_message("ndvi please", is_user=True)
+        page._show_thinking()
+        for _ in range(10):
+            QGIS_APP.processEvents()
+
+        # Exactly what the real task returns: no "files" key at all.
+        page._on_reply({
+            "session_id": "sess-1",
+            "message": TEXT,
+            "llm_message": {"id": 777, "content": TEXT},
+        })
+        reply = [b for b in page._bubbles if b.role == "ai"][-1]
+        self.assertEqual(reply._files, [],
+                         "the task payload should carry no files; "
+                         "that is the premise of this test")
+
+        self._settle()
+        reply = [b for b in page._bubbles if b.role == "ai"][-1]
+        self.assertEqual(len(reply._files), 1,
+                         "the file list never arrived, so no style can")
+        self.assertEqual(reply.style_for(URL), "<sld:Raster/>")
+
+    def test_a_bubble_with_results_but_no_files_triggers_a_fetch(self):
+        """Having an id is not enough; the files are a separate reason.
+
+        A reply gets its id when the turn finishes but never its files, so
+        testing only for a missing id skipped the fetch on exactly the turn
+        whose results needed styling.
+        """
+        URL = "https://app.gopilot.earth/api/llm/files/8080/download/"
+        page = self._page([{"id": 777, "is_user": False,
+                            "content": f"see [r.tif]({URL})",
+                            "files": [{"id": 8080, "name": "r.tif",
+                                       "file_url": URL, "sld": "<sld:X/>"}]}])
+        page.add_message(f"see [r.tif]({URL})", is_user=False,
+                         message_id=777)
+        for _ in range(10):
+            QGIS_APP.processEvents()
+        bubble = page._bubbles[-1]
+        self.assertTrue(page._needs_files(bubble))
+        page._reconcile_message_ids()
+        self._settle()
+        self.assertEqual(page.client.gopilot.calls, 1,
+                         "no fetch was made for the missing file list")
+        self.assertEqual(page._bubbles[-1].style_for(URL), "<sld:X/>")
+
+    def test_files_are_set_before_the_results_are_built(self):
+        """Auto-load clicks the buttons from inside `set_content`.
+
+        A click looks the style up from the file list, so setting the list
+        after `set_content` meant auto-loaded layers were never styled.
+        """
+        import os as _os
+        from rasid_components import gopilot_page as module
+        source = _code_of(_os.path.abspath(module.__file__))
+        set_files = source.index("bubble.set_files(llm_message")
+        set_content = source.index("bubble.set_content(message)")
+        self.assertLess(set_files, set_content,
+                        "set_files runs after set_content")
 
     def test_finishing_a_turn_reconciles_without_being_asked(self):
         """The hook has to be IN `_on_reply`, not merely available to it.

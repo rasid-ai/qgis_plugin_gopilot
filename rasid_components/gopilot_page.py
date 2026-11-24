@@ -50,7 +50,7 @@ from .composer import Composer
 from .config import APP_BASE_URL
 from .geometry import GeometryInputManager
 from .logger import debug_print
-from .message_bubble import MessageBubble
+from .message_bubble import MessageBubble, extract_file_urls
 from .widgets import (
     paint_transparent,
     paint_background,
@@ -929,14 +929,16 @@ class GoPilotPage(QWidget):
                 bubble.set_tool_calls(
                     llm_message.get("tool_calls_content")
                     or self._live_tool_calls, streaming=False)
+                # BEFORE set_content, which builds the result buttons and,
+                # with "load results automatically" on, clicks them. A click
+                # looks the style up from this list, so setting it afterwards
+                # meant auto-loaded layers were never styled.
+                bubble.set_files(llm_message.get("files"))
                 bubble.set_content(message)
                 bubble.set_max_width(self._bubble_budget(bubble.role))
                 # The server only has a row for this reply now, so this is the
                 # earliest its trash control can do anything.
                 bubble.set_message_id(llm_message.get("id"))
-                # The files only exist once the task reports them, so the
-                # bubble was opened without them.
-                bubble.set_files(llm_message.get("files"))
             except RuntimeError:
                 self._hide_thinking()
                 self.add_message(message, is_user=False)
@@ -979,7 +981,12 @@ class GoPilotPage(QWidget):
         """
         if self.client is None or not self.current_chat_id:
             return
-        if not any(self._needs_an_id(b) for b in self._bubbles):
+        # An id OR a file list is reason enough to ask. A reply bubble gets
+        # its id when the turn finishes but never its files, so testing only
+        # for a missing id skipped the fetch on exactly the turn whose
+        # results needed styling.
+        if not any(self._needs_an_id(b) or self._needs_files(b)
+                   for b in self._bubbles):
             return
         thread = FetchMessagesThread(self.client, self.current_chat_id)
         thread.finished.connect(self._on_ids_reconciled)
@@ -997,6 +1004,21 @@ class GoPilotPage(QWidget):
         except RuntimeError:
             return False
 
+    @staticmethod
+    def _needs_files(bubble):
+        """An assistant bubble that offers results but knows nothing of them.
+
+        Results are found by reading the message TEXT for links, so a bubble
+        can have download buttons and still have no file list — and the file
+        list is where each result's style lives.
+        """
+        try:
+            if bubble.role != "ai" or bubble._files:
+                return False
+            return bool(extract_file_urls(bubble.raw_text()))
+        except (RuntimeError, AttributeError):
+            return False
+
     def _on_ids_reconciled(self, messages):
         """Match id-less bubbles to server rows by role and text.
 
@@ -1005,12 +1027,38 @@ class GoPilotPage(QWidget):
         from the web app in another tab, is enough to shift them — and
         assigning the wrong id to a bubble means its trash button deletes
         somebody else's message.
+
+        This also fills in each message's FILE LIST, which is why it matters
+        for more than the trash control. The task's own `llm_message` does
+        not carry `files`, so a bubble built from a live turn has none — and
+        the file list is where each result's SLD lives. The style was
+        therefore missing on every freshly-answered turn and only appeared
+        once the chat was reopened, which is the endpoint this already
+        reads. Measured on a raster result: "No SLD was sent for
+        'ndvi_20261120'", while the same file is styled on the website.
         """
         claimed = set()
         for bubble in self._bubbles:
             try:
                 if bubble.message_id is not None:
                     claimed.add(str(bubble.message_id))
+            except RuntimeError:
+                continue
+
+        # Files first, keyed on the ids we already hold. A bubble that was
+        # given its id when the turn finished still has no files.
+        by_id = {}
+        for message in messages or ():
+            identifier = message.get("id")
+            if identifier is not None:
+                by_id[str(identifier)] = message
+        for bubble in self._bubbles:
+            try:
+                if bubble.message_id is None:
+                    continue
+                message = by_id.get(str(bubble.message_id))
+                if message is not None:
+                    bubble.set_files(message.get("files"))
             except RuntimeError:
                 continue
 
@@ -1035,6 +1083,8 @@ class GoPilotPage(QWidget):
                     continue
                 try:
                     bubble.set_message_id(identifier)
+                    # And its files, for the same reason as above.
+                    bubble.set_files(message.get("files"))
                 except RuntimeError:
                     break
                 claimed.add(str(identifier))

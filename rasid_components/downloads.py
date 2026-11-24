@@ -37,7 +37,7 @@ after the process. Everything else is here, once.
 
 import os
 
-from qgis.PyQt.QtCore import QObject, pyqtSignal
+from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
 
 from . import design, icons
 from .chat_threads import DownloadLayerThread
@@ -73,7 +73,7 @@ class DownloadButton(QObject):
 
     def __init__(self, button, client, url, add_layer,
                  idle_text, busy_text, done_text, filename=None,
-                 threads=None, parent=None):
+                 threads=None, needs_download=True, parent=None):
         super().__init__(parent)
         self.button = button
         self.client = client
@@ -104,6 +104,10 @@ class DownloadButton(QObject):
         # right now": auto-load must fire ONCE per result, and must not fire
         # again after the user has deliberately removed the layer.
         self._has_run = False
+        # False for a layer QGIS fetches itself — a styled tile pyramid is
+        # served straight to the provider, so there is nothing for us to
+        # download and the click goes directly to adding the layer.
+        self._needs_download = needs_download
 
         button.clicked.connect(self.start)
         self._watch_project()
@@ -172,6 +176,17 @@ class DownloadButton(QObject):
             return
         self._has_run = True
 
+        if not self._needs_download:
+            self._set_busy(self._busy_text)
+            # Deferred by one event-loop turn so the busy label actually
+            # PAINTS first. Nothing is downloaded here, but adding a tile
+            # layer still blocks briefly on the network — it reads the
+            # pyramid's `tilemapresource.xml` for its zoom range and extent
+            # — and calling straight through would hold the UI on the old
+            # label, which reads as a click that did nothing.
+            QTimer.singleShot(0, self._install_nothing)
+            return
+
         # Already on disk from a previous click: skip the network entirely.
         # Results are immutable, so the bytes cannot have changed, and this
         # makes "add it again" instant instead of a second download.
@@ -202,6 +217,17 @@ class DownloadButton(QObject):
             return
         self._path = filepath
         self._install(filepath)
+
+    def _install_nothing(self):
+        """``_install(None)``, one event-loop turn later. See :meth:`start`.
+
+        Guarded because the turn is long enough for the bubble to be torn
+        down — a re-render, or the user leaving the page — and the controller
+        would then be working on a deleted button.
+        """
+        if self._closing:
+            return
+        self._install(None)
 
     def _install(self, filepath):
         try:

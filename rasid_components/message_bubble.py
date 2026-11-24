@@ -60,6 +60,7 @@ from .compat import (
 )
 from .downloads import DownloadButton
 from .layer_style import apply_sld
+from .tiles import add_tile_layer, tiles_ready
 from .logger import debug_print
 
 # Extensions GoPilot can hand back and QGIS can open.
@@ -781,29 +782,98 @@ class MessageBubble(QFrame):
         opened before the task has reported any files at all.
         """
         self._files = [f for f in (files or ()) if isinstance(f, dict)]
+        self._log_style_fields()
 
-    def style_for(self, url):
-        """The SLD the API sent for the file at ``url``, or None.
+    def _log_style_fields(self):
+        """Report which style fields each file actually carries.
 
-        Matched on the file id in a download URL first, then on the URL
-        itself. The id is the reliable half: GoPilot rewrites result links to
-        ``/api/llm/files/<id>/download/``, while ``file_url`` can be a
-        presigned link whose query string differs from the one in the text.
+        Diagnostic, and a deliberate one. "The layer is unstyled" has four
+        possible causes that look identical on the map — no file list, a
+        null style field, a style in a format the plugin does not read, or a
+        style it read and rejected — and only the payload can tell them
+        apart. This prints the field names and sizes, never the documents
+        themselves, so the log stays readable.
         """
-        if not url or not self._files:
+        if not self._files:
+            return
+        for entry in self._files:
+            carried = []
+            for key in ("sld", "symbology", "style_config", "tiles_path",
+                        "geojson"):
+                value = entry.get(key)
+                if value in (None, "", {}, []):
+                    continue
+                if isinstance(value, str):
+                    carried.append(f"{key}=str[{len(value)}]")
+                elif isinstance(value, dict):
+                    carried.append(f"{key}=dict{sorted(value.keys())}")
+                elif isinstance(value, list):
+                    carried.append(f"{key}=list[{len(value)}]")
+                else:
+                    carried.append(f"{key}={type(value).__name__}")
+            debug_print(
+                f"[GoPilot] File {entry.get('id')} "
+                f"{entry.get('name')!r} type={entry.get('file_type')!r} "
+                f"carries: {', '.join(carried) or 'NO style fields'} "
+                f"| all keys: {sorted(entry.keys())}")
+
+    def file_entry(self, url, filename=None):
+        """The API's record for this result, or None.
+
+        Three matchers, tried in order of how much they can be trusted:
+
+        1. the file id in a ``/files/<id>/download/`` URL;
+        2. the ``file_url`` on the entry, compared without its query string;
+        3. the FILE NAME.
+
+        The third exists because the first two can both miss. A result link
+        in the message text can be a presigned storage URL — no
+        ``/files/<id>/`` segment to read an id from, and a different URL
+        from the ``file_url`` the payload carries for the same file. When
+        that happened the record was never found, and with it went both the
+        style and the styled tiles.
+
+        The name is a weaker key than an id, so it is only consulted after
+        both stronger ones have failed, and only on an exact match.
+        """
+        if not self._files:
             return None
 
-        identifier = _file_id_in(url)
-        for entry in self._files:
-            if identifier is not None and str(entry.get("id")) == identifier:
-                return entry.get("sld")
+        identifier = _file_id_in(url or "")
+        if identifier is not None:
+            for entry in self._files:
+                if str(entry.get("id")) == identifier:
+                    return entry
 
-        bare = url.split("?", 1)[0]
-        for entry in self._files:
-            candidate = entry.get("file_url") or ""
-            if candidate and candidate.split("?", 1)[0] == bare:
-                return entry.get("sld")
+        if url:
+            bare = url.split("?", 1)[0]
+            for entry in self._files:
+                candidate = entry.get("file_url") or ""
+                if candidate and candidate.split("?", 1)[0] == bare:
+                    return entry
+
+        if filename:
+            wanted = os.path.basename(str(filename)).strip().lower()
+            for entry in self._files:
+                name = os.path.basename(
+                    str(entry.get("name") or "")).strip().lower()
+                if name and name == wanted:
+                    return entry
+
+        debug_print(f"[GoPilot] No file record matched {filename or url!r}. "
+                    f"This message carries "
+                    f"{[(f.get('id'), f.get('name')) for f in self._files]}")
         return None
+
+    def style_for(self, url, filename=None):
+        """The SLD the API sent for this result, or None.
+
+        Rasters do not have one: their colour is applied server-side while
+        the tile pyramid is built, and the website displays that pyramid
+        rather than styling anything. See :mod:`~.tiles`.
+        """
+        entry = self.file_entry(url, filename)
+        return entry.get("sld") if entry else None
 
     def set_message_id(self, message_id):
         """Attach a server row to this bubble, revealing the trash control.
@@ -1156,6 +1226,7 @@ class MessageBubble(QFrame):
                     self._add_image_result(url, filename)
                 else:
                     self._add_layer_result(url, filename)
+                    self._add_styled_view_result(url, filename)
             if files and prefs.get_bool(prefs.AUTO_LOAD_LAYERS):
                 self._auto_load()
 
@@ -1211,12 +1282,58 @@ class MessageBubble(QFrame):
         controller = DownloadButton(
             btn, self.client, url,
             add_layer=lambda path, f=filename, u=url: add_layer_to_qgis(
-                path, f.rsplit(".", 1)[0], self.iface, sld=self.style_for(u)),
+                path, f.rsplit(".", 1)[0], self.iface,
+                sld=self.style_for(u, f)),
             idle_text=f"  Add {filename} to QGIS",
             busy_text=f"  Downloading {filename}…",
             done_text=f"  Added {filename}",
             filename=filename,
             threads=self._download_threads,
+        )
+        self._downloads.append(controller)
+        self._results_layout.addWidget(btn)
+        return btn
+
+    def _add_styled_view_result(self, url, filename):
+        """"Add styled view", for a raster whose pyramid is built.
+
+        The GeoTIFF above is the DATA — real values, queryable, analysable,
+        and in QGIS's own grey stretch because a raster result carries no
+        style. This is the VIEW: the same tile pyramid the website displays,
+        coloured server-side while it was built. Two controls because they
+        answer different questions, and neither substitutes for the other.
+
+        Offered only when the pyramid is actually ready, using the website's
+        own readiness test, so there is never a button here that would fetch
+        404s.
+        """
+        entry = self.file_entry(url, filename)
+        if entry is None or not tiles_ready(entry):
+            return None
+
+        btn = QPushButton()
+        btn.setCursor(Qt_PointingHandCursor)
+        btn.setAutoDefault(False)
+        btn.setIconSize(QSize(design.ICON_SM, design.ICON_SM))
+        btn.setStyleSheet(self._result_button_qss())
+        btn.setMaximumWidth(max(40, self._max_width - 26))
+        btn.setToolTip(
+            "The server-coloured version, as the website shows it. An image "
+            "rather than data: use the file above to query or analyse values.")
+
+        stem = filename.rsplit(".", 1)[0]
+        controller = DownloadButton(
+            btn, self.client, url,
+            add_layer=lambda _path, e=entry, n=stem: add_tile_layer(
+                e, f"{n} (styled)", self.iface,
+                api_key=self._api_token(), client=self.client),
+            idle_text="  Add styled view",
+            busy_text="  Adding styled view…",
+            done_text="  Added styled view",
+            threads=self._download_threads,
+            # The tiles are served to QGIS directly; there is nothing here
+            # for the plugin to fetch.
+            needs_download=False,
         )
         self._downloads.append(controller)
         self._results_layout.addWidget(btn)

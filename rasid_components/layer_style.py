@@ -16,8 +16,8 @@ an SLD is, so ``sld_to_mapbox.js`` parses the XML and rebuilds each rule as
 Mapbox paint properties. Nothing like that is needed here, and writing one
 would be strictly worse than the reader QGIS already ships.
 
-VECTOR ONLY, AND THAT IS NOT A SHORTCUT
-=======================================
+RASTERS ARE TRANSLATED BY HAND
+==============================
 ``loadSldStyle`` refuses raster layers outright — measured on QGIS 3.36.3
 and 4.0.1, with a properly georeferenced raster and a real
 ``RasterSymbolizer``/``ColorMap``, it answers::
@@ -25,18 +25,41 @@ and 4.0.1, with a properly georeferenced raster and a real
     Loading style file ... failed because:
     Layer type 1 not supported
 
-So there is no raster path to write. There is also nothing to style: the
-website never sends a raster through its SLD converter either (which handles
-only Point, Line, Polygon and Text symbolizers), because raster results are
-served to it as pre-rendered TMS tiles with the colouring already baked in.
-SLD is a vector concern in this product, which is exactly where QGIS
-supports it.
+That is a flat refusal by layer type, not a complaint about the document, so
+there is nothing to fix at the SLD end. The colour map therefore has to be
+read out of the XML here and rebuilt as a QGIS renderer —
+``QgsSingleBandPseudoColorRenderer`` over a ``QgsColorRampShader``. Only the
+part of SLD that a raster actually uses is translated; see
+:func:`_raster_renderer` for exactly what, and what is ignored.
+
+The website does not do this, which is why it was not obvious that it was
+needed: there, raster results are pre-rendered TMS tiles with the colouring
+already baked into the images, so the browser never sees a raster SLD. The
+plugin downloads the raw GeoTIFF instead, so without this it shows QGIS's
+default grey stretch where the website shows a colour ramp.
 """
 
 import os
 import tempfile
+import xml.etree.ElementTree as ElementTree
 
 from .logger import debug_print
+
+#: SLD namespaces vary ("sld:" prefixed, default-namespaced, or bare), so
+#: elements are matched on LOCAL name throughout, the same way the website's
+#: own converter does it.
+def _local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def _find_all(node, name):
+    """Every descendant whose local name is ``name``, document order."""
+    return [child for child in node.iter() if _local(child.tag) == name]
+
+
+def _first(node, name):
+    found = _find_all(node, name)
+    return found[0] if found else None
 
 
 def is_sld(text):
@@ -63,15 +86,25 @@ def apply_sld(layer, sld_xml):
     temp file first — and the temp file is removed afterwards, because this
     runs once per downloaded layer and a QGIS session can be open for days.
     """
-    if layer is None or not is_sld(sld_xml):
+    if layer is None:
         return False
 
-    # Rasters are refused by QGIS itself; say so once, quietly, rather than
-    # letting it look like the style was malformed.
-    if _is_raster(layer):
-        debug_print("[GoPilot] Skipping SLD: QGIS does not apply SLD to "
-                    "raster layers (the website styles rasters server-side)")
+    # Said out loud, because "no style arrived" and "the style was rejected"
+    # look identical on the map — an unstyled layer — and the difference
+    # decides whether to look at this plugin or at the payload.
+    if not sld_xml:
+        debug_print(f"[GoPilot] No SLD was sent for {layer.name()!r}; "
+                    f"QGIS will render it with its own defaults")
         return False
+    if not is_sld(sld_xml):
+        debug_print(f"[GoPilot] The style sent for {layer.name()!r} is not "
+                    f"an SLD document: {str(sld_xml)[:120]!r}")
+        return False
+
+    # QGIS will not take an SLD on a raster, so the colour map is read here
+    # and rebuilt as a renderer instead.
+    if _is_raster(layer):
+        return _apply_raster_sld(layer, sld_xml)
 
     handle, path = tempfile.mkstemp(prefix="gopilot_style_", suffix=".sld")
     try:
@@ -147,6 +180,186 @@ def apply_sld(layer, sld_xml):
             os.remove(path)
         except OSError:
             pass
+
+
+def _apply_raster_sld(layer, sld_xml):
+    """Rebuild a ``RasterSymbolizer``'s colour map as a QGIS renderer."""
+    try:
+        root = ElementTree.fromstring(sld_xml)
+    except ElementTree.ParseError as exc:
+        debug_print(f"[GoPilot] Raster SLD will not parse: {exc}")
+        return False
+
+    symbolizer = _first(root, "RasterSymbolizer")
+    if symbolizer is None:
+        # A vector style attached to a raster result. Nothing to do, and
+        # nothing wrong either.
+        debug_print("[GoPilot] Raster SLD has no RasterSymbolizer; "
+                    "leaving QGIS's own rendering alone")
+        return False
+
+    renderer = _raster_renderer(layer, symbolizer)
+    if renderer is None:
+        return False
+
+    opacity = _opacity(symbolizer)
+    if opacity is not None:
+        try:
+            renderer.setOpacity(opacity)
+        except Exception:
+            pass
+
+    try:
+        layer.setRenderer(renderer)
+        layer.triggerRepaint()
+    except Exception as exc:
+        debug_print(f"[GoPilot] Could not set the raster renderer: {exc}")
+        return False
+    return True
+
+
+def _raster_renderer(layer, symbolizer):
+    """A pseudocolour renderer from the symbolizer's ``ColorMap``, or None.
+
+    WHAT IS TRANSLATED
+        ``ColorMap`` and its ``ColorMapEntry`` list — the colour, the
+        quantity, and per-entry opacity — plus the map's ``type``, which
+        chooses how QGIS interpolates:
+
+        ============  ===========================
+        SLD type      QGIS ramp
+        ============  ===========================
+        ``ramp``      Interpolated (the default)
+        ``intervals`` Discrete
+        ``values``    Exact
+        ============  ===========================
+
+        A band from ``ChannelSelection/GrayChannel/SourceChannelName`` is
+        honoured if present.
+
+    WHAT IS NOT
+        ``ContrastEnhancement``, ``ShadedRelief``, ``OverlapBehavior`` and
+        RGB ``ChannelSelection``. A raster that needs those is one QGIS
+        already renders sensibly by itself, and a half-done translation
+        would be worse than none.
+    """
+    try:
+        from qgis.core import (QgsColorRampShader, QgsRasterShader,
+                               QgsSingleBandPseudoColorRenderer)
+        from qgis.PyQt.QtGui import QColor
+    except ImportError:             # pragma: no cover
+        return None
+
+    colour_map = _first(symbolizer, "ColorMap")
+    if colour_map is None:
+        debug_print("[GoPilot] Raster SLD has no ColorMap to translate")
+        return None
+
+    stops = []
+    for entry in _find_all(colour_map, "ColorMapEntry"):
+        colour = QColor(entry.get("color") or "")
+        if not colour.isValid():
+            continue
+        try:
+            quantity = float(entry.get("quantity"))
+        except (TypeError, ValueError):
+            continue
+        # Per-entry opacity is part of the entry's colour in QGIS, which has
+        # no separate alpha on a ramp stop.
+        try:
+            alpha = entry.get("opacity")
+            if alpha is not None:
+                colour.setAlphaF(max(0.0, min(1.0, float(alpha))))
+        except (TypeError, ValueError):
+            pass
+        stops.append((quantity, colour, entry.get("label") or
+                      _tidy_number(quantity)))
+
+    if not stops:
+        debug_print("[GoPilot] Raster SLD ColorMap has no usable entries")
+        return None
+
+    band = _band(layer, symbolizer)
+    if band is None:
+        return None
+
+    stops.sort(key=lambda stop: stop[0])
+    shader_function = QgsColorRampShader()
+    shader_function.setColorRampType(_ramp_type(colour_map))
+    item = QgsColorRampShader.ColorRampItem
+    shader_function.setColorRampItemList(
+        [item(value, colour, label) for value, colour, label in stops])
+
+    shader = QgsRasterShader()
+    shader.setRasterShaderFunction(shader_function)
+    return QgsSingleBandPseudoColorRenderer(
+        layer.dataProvider(), band, shader)
+
+
+def _band(layer, symbolizer):
+    """Which band the colour map applies to, or None to leave the layer be.
+
+    A ColorMap colours ONE band. Applying one to band 1 of a three-band
+    raster would replace a correct RGB rendering with a single-channel ramp
+    — so unless the SLD names a band, a multi-band raster is left alone.
+    That case is real: a result can arrive as an already-classified RGB
+    GeoTIFF that QGIS renders correctly on its own.
+    """
+    named = _first(symbolizer, "SourceChannelName")
+    if named is not None and (named.text or "").strip():
+        try:
+            band = int(float(named.text.strip()))
+        except (TypeError, ValueError):
+            band = None
+        if band and 1 <= band <= layer.bandCount():
+            return band
+        debug_print(f"[GoPilot] Raster SLD names band {named.text!r}, which "
+                    f"this raster does not have")
+        return None
+
+    if layer.bandCount() == 1:
+        return 1
+
+    debug_print(
+        f"[GoPilot] Raster SLD has a ColorMap but no band, and this raster "
+        f"has {layer.bandCount()} bands — leaving QGIS's own rendering "
+        f"alone rather than flattening it to one channel")
+    return None
+
+
+def _ramp_type(colour_map):
+    """SLD's ColorMap ``type`` as a QGIS colour-ramp type.
+
+    Looked up by NAME rather than by the integer: on QGIS 4 these are
+    scoped ``ShaderInterpolationMethod`` members and on 3.36 they are plain
+    ints, and only the attribute name is the same on both.
+    """
+    from qgis.core import QgsColorRampShader
+    wanted = {"ramp": "Interpolated",
+              "intervals": "Discrete",
+              "values": "Exact"}.get(
+                  (colour_map.get("type") or "ramp").strip().lower(),
+                  "Interpolated")
+    kind = getattr(QgsColorRampShader, wanted, None)
+    if kind is None:
+        kind = getattr(QgsColorRampShader.Type, wanted)
+    return kind
+
+
+def _opacity(symbolizer):
+    node = _first(symbolizer, "Opacity")
+    if node is None or not (node.text or "").strip():
+        return None
+    try:
+        return max(0.0, min(1.0, float(node.text.strip())))
+    except (TypeError, ValueError):
+        return None
+
+
+def _tidy_number(value):
+    """``0.35`` not ``0.35000000000000003``, for the legend label."""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text or "0"
 
 
 #: How many features to test before giving the style the benefit of the
