@@ -22,16 +22,35 @@ class RasidPluginDialogTest(unittest.TestCase):
     """Test rerources work."""
 
     def setUp(self):
-        """Runs before each test."""
-        pass
+        """Register the compiled Qt resources this test looks things up in.
+
+        The import is the whole point: the resource path below only resolves
+        once ``resources.py`` has run, and this test never imported it. It
+        therefore passed only when some EARLIER test in the run happened to
+        import it first — which is why it was green on Qt5 and red on Qt6,
+        where the tests that used to do so are gone.
+        """
+        import resources                              # noqa: F401
 
     def tearDown(self):
         """Runs after each test."""
         pass
 
     def test_icon_png(self):
-        """Test we can click OK."""
-        path = ':/plugins/RasidPlugin/icon.png'
+        """The compiled .qrc registers the prefix it declares.
+
+        NOTE: nothing in the plugin reads this resource. The toolbar icon is
+        loaded from the filesystem (``rasid_plugin.py`` joins the plugin dir
+        with ``gopilot-mark.svg``), so ``resources.py`` is imported for its
+        side effect and never used. This test is kept only because it is the
+        one thing that would notice the .qrc failing to compile.
+
+        The path was ``/plugins/RasidPlugin/`` — Plugin Builder's original
+        camel-case name, which the .qrc has never used. It declares
+        ``/plugins/rasid_plugin``, so that was asserting a resource that has
+        never existed in this repo.
+        """
+        path = ':/plugins/rasid_plugin/icon.png'
         icon = QIcon(path)
         self.assertFalse(icon.isNull())
 

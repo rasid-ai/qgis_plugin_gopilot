@@ -7,11 +7,17 @@ Uses venv_manager for proper dependency isolation from QGIS Python environment.
 """
 
 import sys
-from qgis.PyQt.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QTextEdit, QMessageBox
+from qgis.PyQt.QtWidgets import (
+    QDialog, QHBoxLayout, QVBoxLayout, QLabel, QTextEdit, QMessageBox,
+)
 from qgis.PyQt.QtCore import QThread, pyqtSignal
-from qgis.PyQt.QtGui import QFont
-from ..compat import Qt_RichText, Qt_PointingHandCursor, exec_dialog, QDialog_Accepted
-from .. import theme_utils
+from ..compat import Qt_RichText, exec_dialog, QDialog_Accepted
+# design/widgets/icons import nothing but Qt and the standard library, which
+# is what makes them safe HERE: this dialog is what runs when the bundled
+# packages are missing, so anything it touches has to work before a single
+# dependency has been installed.
+from .. import design
+from ..widgets import primary_button, secondary_button
 from . import venv_manager
 
 
@@ -25,29 +31,33 @@ class DependencyInstallerDialog(QDialog):
 
     def setup_ui(self):
         """Setup the UI."""
-        self.setWindowTitle("Install Required Libraries")
-        self.setMinimumWidth(450)
+        self.setWindowTitle("Install required libraries")
+        self.setMinimumWidth(460)
         self.setMinimumHeight(200)
 
-        # Theme-aware styling
-        bg_color = theme_utils.get_card_bg()
-        text_color = theme_utils.get_text_color()
-        border_color = theme_utils.get_card_border()
-        button_hover = theme_utils.get_hover_bg()
+        t = design.tokens()
 
-        self.setStyleSheet(f"background: {bg_color}; color: {text_color};")
+        # Scoped to this dialog. A bare `background:` here also
+        # matched every child widget, so the dialog's own buttons and
+        # inputs inherited a flat fill instead of their own styling —
+        # and any child window would inherit it too. See
+        # widgets.paint_transparent for the same mistake at a worse
+        # spot in the tree.
+        self.setObjectName("dependencyInstaller")
+        self.setStyleSheet(
+            f"QDialog#dependencyInstaller {{ background: {t.surface}; }}")
 
         layout = QVBoxLayout()
-        layout.setSpacing(10)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(design.SPACE_3)
+        layout.setContentsMargins(design.SPACE_5, design.SPACE_5,
+                                  design.SPACE_5, design.SPACE_5)
 
-        # Title
-        title = QLabel("Required Libraries Missing")
-        title_font = QFont()
-        title_font.setPointSize(11)
-        title_font.setBold(True)
-        title.setFont(title_font)
-        title.setStyleSheet(f"color: {text_color};")
+        # The product's heading style rather than a bold 11pt QFont. A POINT
+        # size is resolved against the screen's DPI and tracks nothing else in
+        # the plugin, which is measured in px off design's type scale — so
+        # this heading drifted away from every other heading in the panel.
+        title = QLabel("Required libraries missing")
+        title.setStyleSheet(design.heading_qss(design.TEXT_XL))
         layout.addWidget(title)
 
         # Description
@@ -61,72 +71,59 @@ class DependencyInstallerDialog(QDialog):
         )
         desc.setTextFormat(Qt_RichText)
         desc.setWordWrap(True)
-        desc.setStyleSheet(f"color: {text_color};")
+        desc.setStyleSheet(design.body_qss(design.TEXT_MD, secondary=True))
         layout.addWidget(desc)
 
-        # Progress/output text area
+        # Progress/output text area. A console, so it is the one place in the
+        # dialog that wants MONO_STACK — but design's stack, not a bare
+        # 'Courier New', which is the only one of the five that Windows
+        # actually has and is nobody's first choice of monospace.
         self.output_text = QTextEdit()
+        self.output_text.setObjectName("installerOutput")
         self.output_text.setReadOnly(True)
         self.output_text.setVisible(False)
-        output_bg = theme_utils.get_sidebar_bg()
-        self.output_text.setStyleSheet(f"""
-            QTextEdit {{
-                background: {output_bg};
-                color: {text_color};
-                border: 1px solid {border_color};
-                border-radius: 4px;
-                padding: 8px;
-                font-family: 'Courier New', monospace;
-                font-size: 11px;
+        self.output_text.setStyleSheet(
+            f"""
+            QTextEdit#installerOutput {{
+                background: {t.surface_sunken};
+                color: {t.text_secondary};
+                border: {design.BORDER}px solid {t.border};
+                border-radius: {design.RADIUS}px;
+                padding: {design.SPACE_2}px;
+                font-family: {design.MONO_STACK};
+                font-size: {design.TEXT_SM}px;
             }}
-        """)
+            """
+            + design.scrollbar_qss("QTextEdit#installerOutput")
+        )
         layout.addWidget(self.output_text)
 
         # Add stretch to push buttons to bottom when output is hidden
         layout.addStretch()
 
-        # Buttons
-        self.install_button = QPushButton("Install")
-        self.install_button.setCursor(Qt_PointingHandCursor)
-        self.install_button.setStyleSheet(f"""
-            QPushButton {{
-                background: {theme_utils.BRAND_PRIMARY};
-                color: white;
-                border: none;
-                border-radius: 6px;
-                padding: 12px;
-                font-weight: bold;
-                font-size: 13px;
-            }}
-            QPushButton:hover {{
-                background: {theme_utils.BRAND_HOVER};
-            }}
-            QPushButton:disabled {{
-                background: #666;
-                color: #999;
-            }}
-        """)
-        self.install_button.clicked.connect(self.start_installation)
-        layout.addWidget(self.install_button)
+        # A right-aligned row, secondary then primary — the button order every
+        # other dialog in the plugin uses. These were two full-width stacked
+        # buttons with Cancel UNDER Install, each hand-rolled with its own
+        # radius, padding and weight, and the disabled state was #666 on #999
+        # (a 1.6:1 grey pair belonging to no palette here).
+        button_row = QHBoxLayout()
+        button_row.setSpacing(design.SPACE_2)
+        button_row.addStretch()
 
-        self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.setCursor(Qt_PointingHandCursor)
-        self.cancel_button.setStyleSheet(f"""
-            QPushButton {{
-                background: {theme_utils.get_sidebar_bg()};
-                color: {text_color};
-                border: 2px solid {border_color};
-                border-radius: 6px;
-                padding: 12px;
-                font-weight: bold;
-                font-size: 13px;
-            }}
-            QPushButton:hover {{
-                background: {button_hover};
-            }}
-        """)
+        # Primary FIRST, Cancel second — see drawing_help_dialog for why this
+        # deliberately differs from the SaaS footer.
+        #
+        # No icon, for consistency with the other two dialogs swept with it.
+        self.install_button = primary_button("Install")
+        self.install_button.setDefault(True)
+        self.install_button.clicked.connect(self.start_installation)
+        button_row.addWidget(self.install_button)
+
+        self.cancel_button = secondary_button("Cancel")
         self.cancel_button.clicked.connect(self.reject)
-        layout.addWidget(self.cancel_button)
+        button_row.addWidget(self.cancel_button)
+
+        layout.addLayout(button_row)
 
         self.setLayout(layout)
 
@@ -155,7 +152,7 @@ class DependencyInstallerDialog(QDialog):
         self.worker = None
 
         if success:
-            self.output_text.append(f"\n✓ {message}")
+            self.output_text.append(f"\nDone — {message}")
             QMessageBox.information(
                 self,
                 "Success",
@@ -164,7 +161,7 @@ class DependencyInstallerDialog(QDialog):
             )
             self.accept()
         else:
-            self.output_text.append(f"\n✗ {message}")
+            self.output_text.append(f"\nFailed — {message}")
             missing = venv_manager.get_missing_packages()
             manual_install = ' '.join(missing)
             QMessageBox.critical(

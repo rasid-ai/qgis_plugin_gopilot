@@ -25,20 +25,39 @@ from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 
-from . import resources  
-# NOTE: RasidPluginDialog is imported lazily inside _show_main_dialog(), not
-# here. Its import chain pulls in `markdown` (via gopilot_page), which is a
+from . import resources
+# NOTE: GoPilotDock is imported lazily inside _show_panel(), not here. Its
+# import chain pulls in `markdown` (via gopilot_page), which is a
 # bundled-in-venv dependency that only becomes importable AFTER
 # DependencyManager.prompt_install() runs in run(). Importing it at module load
 # (classFactory time) would raise ModuleNotFoundError on a fresh install,
 # before the user can install dependencies — breaking plugin load entirely.
-from .rasid_components.login_dialog import LoginDialog
-from .rasid_components.compat import exec_dialog, QDialog_Accepted
+from .rasid_components.compat import Qt_RightDockWidgetArea
 from .rasid_components.rasid_client import RasidClient
 from .rasid_components.dependencies import DependencyManager
 from .rasid_components.logger import debug_print
 from qgis.PyQt.QtWidgets import QMessageBox
 import os.path
+
+
+# Submenu under QGIS's Plugins menu, and the toolbar button's
+# tooltip. Must be identical in addPluginToMenu and
+# removePluginMenu or the entry is orphaned on unload.
+MENU_TITLE = "GoPilot"
+
+# Our own toolbar, rather than a button on QGIS's shared Plugins toolbar.
+#
+# addToolBarIcon() put the button on the Plugins toolbar, which GoPilot then
+# shared with whatever else lives there — Plugin Reloader, in this profile — so
+# it sat at the end of that row and could not be moved without taking the
+# others with it. Plugins whose buttons sit together in a row of their own all
+# did this instead: asked QGIS for a toolbar of their own.
+#
+# The OBJECT NAME matters beyond cosmetics: QGIS saves and restores toolbar
+# position per profile keyed on it, so without one the toolbar reappears
+# wherever Qt puts it after each restart and the user's arrangement is lost.
+TOOLBAR_TITLE = "GoPilot"
+TOOLBAR_OBJECT_NAME = "GoPilotToolbar"
 
 
 class RasidPlugin:
@@ -62,7 +81,9 @@ class RasidPlugin:
         self.menu = self.tr(u'&Rasid')
         self.first_start = None
         self.client = None
-        self.dlg = None
+        self.dock = None
+        # Created on demand by _ensure_toolbar, and torn down in unload.
+        self.toolbar = None
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -75,6 +96,7 @@ class RasidPlugin:
         callback,
         enabled_flag=True,
         add_to_toolbar=True,
+        add_to_menu=True,
         status_tip=None,
         whats_this=None,
         parent=None):
@@ -91,82 +113,193 @@ class RasidPlugin:
             action.setWhatsThis(whats_this)
 
         if add_to_toolbar:
-            self.iface.addWebToolBarIcon(action)
+            # Our own toolbar — see TOOLBAR_OBJECT_NAME. This was
+            # addWebToolBarIcon (the Web toolbar, usually hidden), then
+            # addToolBarIcon (QGIS's shared Plugins toolbar, where the button
+            # was stuck behind whatever else was on that row).
+            #
+            # The fallback is not decoration: if addToolBar ever returns None
+            # there would otherwise be no way at all to open the panel, so it
+            # degrades to the shared toolbar rather than to nothing.
+            toolbar = self._ensure_toolbar()
+            if toolbar is not None:
+                toolbar.addAction(action)
+            else:
+                self.iface.addToolBarIcon(action)
+
+        if add_to_menu:
+            # And the Plugins menu, the other half of where a plugin lives.
+            # The plugin had no menu entry at all, so a user who hides
+            # toolbars had no way to reach it except the Panels list.
+            self.iface.addPluginToMenu(MENU_TITLE, action)
 
         self.actions.append(action)
         return action
 
+    def _ensure_toolbar(self):
+        """The plugin's own toolbar, created once. None if QGIS declined."""
+        if self.toolbar is None:
+            self.toolbar = self.iface.addToolBar(TOOLBAR_TITLE)
+            if self.toolbar is not None:
+                self.toolbar.setObjectName(TOOLBAR_OBJECT_NAME)
+        return self.toolbar
+
     def initGui(self):
-        icon_path = os.path.join(self.plugin_dir, 'icon.png')
+        # The GoPilot mark, not the RASID company one: the toolbar button
+        # opens GoPilot, and this is the only place a user sees the plugin
+        # before they open it.
+        icon_path = os.path.join(self.plugin_dir, 'gopilot-mark.svg')
         self.add_action(
             icon_path,
-            text=self.tr(u'Rasid'),
+            # The product's name. The button said "Rasid", which is the
+            # company; metadata.txt has called the plugin GoPilot for a while.
+            text=self.tr(u'GoPilot'),
             callback=self.run,
+            status_tip=self.tr(u'Open the GoPilot panel'),
             parent=self.iface.mainWindow())
         self.first_start = True
 
     def unload(self):
         for action in self.actions:
-            self.iface.removeWebToolBarIcon(action)
+            # Mirror of add_action. Removing from the wrong place leaves a
+            # dead button behind after an uninstall or a reload.
+            self.iface.removePluginMenu(MENU_TITLE, action)
+            if self.toolbar is not None:
+                self.toolbar.removeAction(action)
+            else:
+                self.iface.removeToolBarIcon(action)
 
-    def _show_main_dialog(self):
-        """Open the main dialog and show GoPilot by default."""
-        # Lazy import: safe only after prompt_install() (called in run()) has
-        # created the venv and put its site-packages on sys.path, so `markdown`
-        # is importable. See the import note at the top of this module.
-        from .rasid_plugin_dialog import RasidPluginDialog
-        self.dlg = RasidPluginDialog(self.client, iface=self.iface)
-        self.dlg.show_gopilot()
-        self.dlg.show()
-        try:
-            exec_dialog(self.dlg)
-        finally:
-            # Safety net: reject()/Esc close the modal loop without firing
-            # closeEvent, so ensure page threads and the map tool are released.
+        # And the toolbar, or a reload stacks up an empty one each time.
+        if self.toolbar is not None:
+            self.toolbar.deleteLater()
+            self.toolbar = None
+
+        # Tear the panel down here and nowhere else: this is the one point at
+        # which QGIS guarantees the widget can be removed and deleted safely.
+        # Closing the dock only hides it, so its threads keep running and an
+        # answer that arrives while it is hidden is still waiting on reopen.
+        if self.dock is not None:
             try:
-                self.dlg._cleanup_pages()
+                self.dock.cleanup()
+                self.iface.removeDockWidget(self.dock)
+                self.dock.deleteLater()
             except Exception as exc:
-                # Best-effort cleanup on modal close; log and continue teardown.
-                debug_print(f"[RasidPlugin] Error during page cleanup: {exc}")
+                debug_print(f"[RasidPlugin] Error removing dock: {exc}")
+            finally:
+                self.dock = None
+
+    def _show_panel(self, client=None):
+        """Create the dock on first use, then reveal it."""
+        if self.dock is None:
+            # Lazy import: safe only after prompt_install() (called in run())
+            # has created the venv and put its site-packages on sys.path, so
+            # `markdown` is importable. See the note at the top of this module.
+            from .rasid_components.gopilot_dock import GoPilotDock
+            self.dock = GoPilotDock(
+                client if client is not None else self.client,
+                iface=self.iface)
+            self.iface.addDockWidget(Qt_RightDockWidgetArea, self.dock)
+            self.dock.shell.logout_requested.connect(self.do_logout)
+            self.dock.sign_in_requested.connect(self._on_sign_in)
+        self.dock.reveal()
+
+    def do_logout(self):
+        """Sign out, clear the saved credential, and close the panel."""
+        if self.client:
+            try:
+                self.client.logout()
+            except Exception as exc:
+                # A failed server-side logout must not strand the user in a
+                # signed-in UI — carry on and clear the local credential.
+                debug_print(f"[RasidPlugin] Server logout failed: {exc}")
+
+        settings = QSettings()
+        email = settings.value("rasid_plugin/email", "")
+        if email:
+            try:
+                import keyring
+                keyring.delete_password("rasid_plugin", email)
+            except Exception as exc:
+                debug_print(
+                    f"[RasidPlugin] Could not delete keyring credential: {exc}")
+        settings.remove("rasid_plugin/email")
+
+        self.client = None
+        if self.dock is not None:
+            # Back to the sign-in card, rather than tearing the panel down.
+            # Destroying it meant signing out closed the panel and dropped the
+            # user's dock position with it; this keeps both, and signing back
+            # in is one field away.
+            try:
+                self.dock.shell.set_client(None)
+                self.dock.login_view.api_key_input.clear()
+                self.dock.show_signin()
+            except Exception as exc:
+                debug_print(f"[RasidPlugin] Error resetting dock: {exc}")
 
     def run(self):
-        # Check and install dependencies first
+        """Open the panel. Docked either way — signed in or not.
+
+        The order here is the point. This used to show a MODAL login window
+        first and create the dock only once a key had validated, so a user
+        who was not signed in got a floating dialog in front of QGIS instead
+        of the panel they had just clicked for. Now the panel docks, and the
+        sign-in card is one of its pages.
+        """
+        if self.dock is not None:
+            self.dock.reveal()
+            return
+
+        # Dependencies first: the dock imports `markdown`, which only exists
+        # once the venv has been created and put on sys.path.
         if not DependencyManager.prompt_install(self.iface.mainWindow()):
             QMessageBox.warning(
                 self.iface.mainWindow(),
                 "Dependencies Required",
-                "Required libraries are not installed. The plugin cannot run without them."
+                "Required libraries are not installed. The plugin cannot run "
+                "without them."
             )
             return
 
-        # Initialize client
         self.client = RasidClient()
+        signed_in = False
+        try:
+            signed_in = bool(self.client.load_api_key()
+                             and self.client.is_authenticated())
+        except Exception as exc:
+            # A saved key that cannot be checked — offline, or the API is
+            # down — must not stop the panel opening. The card says why.
+            debug_print(f"[RasidPlugin] Could not verify saved key: {exc}")
 
-        # Try to load saved API key first
-        if self.client.load_api_key() and self.client.is_authenticated():
-            # API key is valid, proceed to main dialog
-            self._show_main_dialog()
-            return
-
-        # No valid API key - show login dialog
-        login_dialog = LoginDialog()
-        if exec_dialog(login_dialog) != QDialog_Accepted:
-            return
-
-        # Get API key from dialog
-        api_key = login_dialog.api_key_input.text().strip()
-
-        if not api_key:
-            QMessageBox.warning(self.iface.mainWindow(), "Error", "Please enter an API key")
-            return
-
-        # Set and validate API key
-        self.client.set_api_key(api_key)
-
-        if self.client.is_authenticated():
-            # Save valid API key
-            self.client.save_api_key()
-            self._show_main_dialog()
-        else:
-            QMessageBox.critical(self.iface.mainWindow(), "Authentication Failed", "Invalid or revoked API key")
+        self._show_panel(client=self.client if signed_in else None)
+        if not signed_in:
             self.client = None
+            self.dock.show_signin()
+
+    def _on_sign_in(self, api_key):
+        """Validate a key typed into the docked card."""
+        api_key = (api_key or "").strip()
+        if not api_key:
+            self.dock.show_signin("Enter your API key to continue.")
+            return
+
+        self.dock.login_view.set_busy(True, "Checking…")
+        try:
+            client = RasidClient()
+            client.set_api_key(api_key)
+            valid = client.is_authenticated()
+        except Exception as exc:
+            debug_print(f"[RasidPlugin] Sign-in check failed: {exc}")
+            self.dock.show_signin(
+                "Could not reach RASID to check that key. Check your "
+                "connection and try again.")
+            return
+
+        if not valid:
+            self.dock.show_signin(
+                "That API key was refused. Check it, or create a new one.")
+            return
+
+        client.save_api_key()
+        self.client = client
+        self.dock.set_client(client)

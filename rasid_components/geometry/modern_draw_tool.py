@@ -11,9 +11,11 @@ Features:
 - Modern glassmorphism styling
 """
 
-from qgis.PyQt.QtCore import pyqtSignal, Qt, QTimer, QRectF, QPointF
-from qgis.PyQt.QtGui import QColor, QPainter, QPen, QBrush, QFont, QCursor, QPixmap
-from qgis.PyQt.QtWidgets import QWidget, QHBoxLayout, QPushButton, QLabel, QVBoxLayout, QFrame
+from qgis.PyQt.QtCore import pyqtSignal, QPoint, QTimer
+from qgis.PyQt.QtGui import QColor, QPainter, QPen, QBrush, QCursor, QPixmap
+from qgis.PyQt.QtWidgets import (
+    QApplication, QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
+)
 from qgis.core import (
     QgsWkbTypes, QgsPointXY, QgsProject,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
@@ -24,196 +26,232 @@ from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
 from ..compat import (
     Qt_LeftButton, Qt_RightButton,
     Qt_Tool, Qt_FramelessWindowHint, Qt_WindowStaysOnTopHint,
-    Qt_WA_TranslucentBackground, QFrame_HLine, Qt_SolidLine,
     Qt_transparent, QPainter_Antialiasing,
+    Qt_WA_TranslucentBackground, Qt_SolidLine,
     Qt_Key_Escape, Qt_Key_Backspace, Qt_Key_Delete, Qt_Key_Return, Qt_Key_Enter,
 )
-from .. import theme_utils
+from .. import design, icons, prefs
+from ..widgets import IconButton, primary_button
+from ..window_drag import WindowDragFilter
+
+
+def _with_alpha(hex_colour, alpha):
+    """A token colour at a given 0-255 alpha, for Qt's canvas APIs.
+
+    ``design.alpha`` returns a CSS string for stylesheets; QgsRubberBand wants
+    a real QColor, so the conversion happens here rather than at each call.
+    """
+    colour = QColor(hex_colour)
+    colour.setAlpha(alpha)
+    return colour
 
 
 class DrawingToolbar(QWidget):
-    """Floating toolbar for drawing controls"""
+    """Floating draw controls: ONE ROW, movable, parked where you leave it.
+
+    SHAPE
+    =====
+    This was a 280x300 card — a title, three lines of measurements, four
+    full-width stacked buttons and a keyboard-hint line. Measured, that is
+    9% of the area of a 1280x720 canvas and 42% of its HEIGHT, sitting on top
+    of the imagery the user is tracing, and it could not be moved out of the
+    way. It is now a single ~40px strip: the measurements read inline, only
+    the primary action keeps its label, and the other three are icon buttons
+    whose tooltips carry the wording and the shortcut. About 1.5% of the same
+    canvas.
+
+    MOVABLE
+    =======
+    Frameless windows have no caption for the OS to drag, so the move
+    arithmetic is ours — :class:`~..window_drag.WindowDragFilter`, the same
+    one the undocked panel uses. The whole strip is a handle except where a
+    button sits, since a button consumes its own press. The position is
+    remembered between draws, because a bar you have to re-park on every
+    polygon is barely better than one that cannot move.
+    """
 
     undo_clicked = pyqtSignal()
     clear_clicked = pyqtSignal()
     finish_clicked = pyqtSignal()
     cancel_clicked = pyqtSignal()
 
+    # Kept off the canvas edges when falling back to the default corner, and
+    # used to decide whether a remembered position is still reachable.
+    EDGE_MARGIN = 16
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt_Tool | Qt_FramelessWindowHint | Qt_WindowStaysOnTopHint)
+        self.setWindowFlags(Qt_Tool | Qt_FramelessWindowHint
+                            | Qt_WindowStaysOnTopHint)
         self.setAttribute(Qt_WA_TranslucentBackground)
 
-        # Main layout
+        t = design.tokens()
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Container frame with glassmorphism effect
+        # A SOLID card, not a glass panel.
+        #
+        # This was `rgba(30, 41, 59, 0.85)` — slate-900 at 85%, a colour from
+        # no palette the plugin uses, with white-translucent buttons on it. It
+        # is now the same surface, border and radius as every other card in
+        # the product.
+        #
+        # Solid rather than translucent on purpose: the toolbar floats over
+        # whatever imagery the user is tracing, and a translucent panel takes
+        # its legibility from the map underneath — which can be anything from
+        # snow to open water.
         self.frame = QFrame()
-        self.frame.setStyleSheet(f"""
-            QFrame {{
-                background: rgba(30, 41, 59, 0.85);
-                border: 1px solid rgba(255, 255, 255, 0.1);
-                border-radius: 12px;
-                padding: 12px;
-            }}
-        """)
-        frame_layout = QVBoxLayout(self.frame)
-        frame_layout.setContentsMargins(12, 12, 12, 12)
-        frame_layout.setSpacing(8)
+        self.frame.setObjectName("drawToolbar")
+        self.frame.setStyleSheet(
+            f"QFrame#drawToolbar {{ background:{t.surface}; "
+            f"border:1px solid {t.border}; "
+            f"border-radius:{design.RADIUS_LG}px; }}"
+        )
+        frame_layout = QHBoxLayout(self.frame)
+        frame_layout.setContentsMargins(design.SPACE_2, design.SPACE_1,
+                                        design.SPACE_2, design.SPACE_1)
+        frame_layout.setSpacing(design.SPACE_2)
 
-        # Title
-        title = QLabel("✏️ Drawing Mode")
-        title.setStyleSheet("""
-            QLabel {
-                color: white;
-                font-size: 14px;
-                font-weight: bold;
-                background: transparent;
-                border: none;
-            }
-        """)
-        frame_layout.addWidget(title)
+        # ── drag handle ───────────────────────────────────────
+        self.grip = QLabel()
+        self.grip.setPixmap(icons.pixmap("grip", design.ICON_SM,
+                                         t.text_muted, dpr=2.0))
+        self.grip.setToolTip("Drag to move these controls")
+        self.grip.setStyleSheet("background:transparent; border:none;")
+        frame_layout.addWidget(self.grip)
 
-        # Info label (points, area, etc.)
-        self.info_label = QLabel("0 points")
-        self.info_label.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.7);
-                font-size: 11px;
-                background: transparent;
-                border: none;
-                padding: 4px 0;
-            }
-        """)
-        self.info_label.setWordWrap(True)
+        # ── live measurements, inline ──────────────────────────
+        # No word wrap: wrapping is what let this grow to three lines. The
+        # strip stays one row, and the text is written short enough to fit.
+        self.info_label = QLabel("Click the map to add points")
+        self.info_label.setStyleSheet(
+            design.body_qss(design.TEXT_BASE, secondary=True))
         frame_layout.addWidget(self.info_label)
+        frame_layout.addStretch()
 
-        # Separator
-        separator = QFrame()
-        separator.setFrameShape(QFrame_HLine)
-        separator.setStyleSheet("background: rgba(255, 255, 255, 0.1); max-height: 1px;")
-        frame_layout.addWidget(separator)
-
-        # Buttons
-        button_style = """
-            QPushButton {
-                background: rgba(255, 255, 255, 0.1);
-                color: white;
-                border: 1px solid rgba(255, 255, 255, 0.2);
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-size: 12px;
-                text-align: left;
-            }
-            QPushButton:hover {
-                background: rgba(255, 255, 255, 0.2);
-                border-color: rgba(255, 255, 255, 0.3);
-            }
-            QPushButton:pressed {
-                background: rgba(255, 255, 255, 0.15);
-            }
-            QPushButton:disabled {
-                background: rgba(255, 255, 255, 0.05);
-                color: rgba(255, 255, 255, 0.3);
-            }
-        """
-
-        # Undo button
-        self.undo_btn = QPushButton("⎌ Undo Last Point")
-        self.undo_btn.setStyleSheet(button_style)
-        self.undo_btn.clicked.connect(self.undo_clicked.emit)
-        self.undo_btn.setEnabled(False)
-        self.undo_btn.setToolTip("Remove last point (Backspace)")
-        frame_layout.addWidget(self.undo_btn)
-
-        # Clear button
-        self.clear_btn = QPushButton("🗑️ Clear All")
-        self.clear_btn.setStyleSheet(button_style)
-        self.clear_btn.clicked.connect(self.clear_clicked.emit)
-        self.clear_btn.setEnabled(False)
-        self.clear_btn.setToolTip("Remove all points and start over")
-        frame_layout.addWidget(self.clear_btn)
-
-        # Finish button
-        self.finish_btn = QPushButton("✓ Finish Polygon")
-        self.finish_btn.setStyleSheet("""
-            QPushButton {
-                background: rgba(34, 197, 94, 0.8);
-                color: white;
-                border: 1px solid rgba(34, 197, 94, 0.4);
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-size: 12px;
-                font-weight: bold;
-                text-align: left;
-            }
-            QPushButton:hover {
-                background: rgba(34, 197, 94, 1);
-            }
-            QPushButton:pressed {
-                background: rgba(34, 197, 94, 0.7);
-            }
-            QPushButton:disabled {
-                background: rgba(34, 197, 94, 0.3);
-                color: rgba(255, 255, 255, 0.5);
-            }
-        """)
-        self.finish_btn.clicked.connect(self.finish_clicked.emit)
+        # ── actions ─────────────────────────────────────────
+        # Only the primary action keeps a label. The other three became icon
+        # buttons: a third of the width each, and their tooltips carry both
+        # the wording and the shortcut, which is what the removed hint line
+        # was for. (The labels before that were "⌬ Undo Last Point",
+        # "🗑️ Clear All", "✓ Finish Polygon", "✕ Cancel" — emoji the host
+        # font drew at whatever size it liked.)
+        self.finish_btn = primary_button("Finish")
         self.finish_btn.setEnabled(False)
-        self.finish_btn.setToolTip("Complete polygon (Right-click or Enter)")
+        self.finish_btn.setToolTip("Complete the area (Enter or right-click)")
+        self.finish_btn.clicked.connect(self.finish_clicked.emit)
         frame_layout.addWidget(self.finish_btn)
 
-        # Cancel button
-        cancel_btn = QPushButton("✕ Cancel")
-        cancel_btn.setStyleSheet("""
-            QPushButton {
-                background: rgba(239, 68, 68, 0.6);
-                color: white;
-                border: 1px solid rgba(239, 68, 68, 0.3);
-                border-radius: 6px;
-                padding: 8px 12px;
-                font-size: 12px;
-                text-align: left;
-            }
-            QPushButton:hover {
-                background: rgba(239, 68, 68, 0.8);
-            }
-            QPushButton:pressed {
-                background: rgba(239, 68, 68, 0.5);
-            }
-        """)
-        cancel_btn.clicked.connect(self.cancel_clicked.emit)
-        cancel_btn.setToolTip("Cancel drawing (ESC)")
-        frame_layout.addWidget(cancel_btn)
+        self.undo_btn = IconButton(
+            "undo", size=28, icon_size=14,
+            tooltip="Undo last point (Backspace)")
+        self.undo_btn.setEnabled(False)
+        self.undo_btn.clicked.connect(self.undo_clicked.emit)
+        frame_layout.addWidget(self.undo_btn)
 
-        # Shortcuts hint
-        hint = QLabel("💡 Shortcuts: Backspace (undo) • Enter (finish) • ESC (cancel)")
-        hint.setStyleSheet("""
-            QLabel {
-                color: rgba(255, 255, 255, 0.5);
-                font-size: 10px;
-                background: transparent;
-                border: none;
-                padding: 4px 0 0 0;
-            }
-        """)
-        hint.setWordWrap(True)
-        frame_layout.addWidget(hint)
+        # "trash", not "refresh". With the labels gone the glyph is the only
+        # thing distinguishing these, and rendered at 14px `undo` and
+        # `refresh` are the same arc at two rotations — side by side they
+        # read as one control repeated. A bin is a different silhouette, and
+        # clearing every point IS a delete, which is what this button was
+        # before the emoji were removed ("🗑️ Clear All").
+        self.clear_btn = IconButton(
+            "trash", size=28, icon_size=14, tone="muted",
+            hover_tone="danger",
+            tooltip="Clear every point and start again")
+        self.clear_btn.setEnabled(False)
+        self.clear_btn.clicked.connect(self.clear_clicked.emit)
+        frame_layout.addWidget(self.clear_btn)
+
+        # Cancel is the only destructive one here: finishing keeps the area,
+        # clearing keeps the tool, cancelling throws the work away. Red on
+        # HOVER rather than at rest — a permanently red control on a one-row
+        # strip beside three neutral ones reads as an error state.
+        self.cancel_btn = IconButton(
+            "close", size=28, icon_size=14, tone="muted",
+            hover_tone="danger", tooltip="Discard this area (Esc)")
+        self.cancel_btn.clicked.connect(self.cancel_clicked.emit)
+        frame_layout.addWidget(self.cancel_btn)
 
         layout.addWidget(self.frame)
 
+        # The strip is its own drag handle. Attached to the FRAME and to the
+        # two passive widgets on it, not to `self`: the outer widget is
+        # translucent and is not what the pointer lands on. The buttons are
+        # deliberately left out, since a button consumes its own press and
+        # must keep working as a button.
+        self._drag = WindowDragFilter()
+        for handle in (self.frame, self.grip, self.info_label):
+            self._drag.attach(handle)
+
+    # ── position ───────────────────────────────────────────
+    def remembered_position(self):
+        """The saved screen position, if it is still on a connected screen.
+
+        Returns None when nothing is saved or the saved point is no longer
+        reachable. A position from a monitor that has since been unplugged
+        would otherwise park the bar off-screen with no way to get it back.
+        """
+        raw = prefs.get_str(prefs.DRAW_BAR_POS)
+        if not raw:
+            return None
+        try:
+            x_text, y_text = raw.split(",", 1)
+            point = QPoint(int(x_text), int(y_text))
+        except (ValueError, TypeError):
+            return None
+        for screen in QApplication.screens():
+            if screen.availableGeometry().contains(point):
+                return point
+        return None
+
+    def remember_position(self):
+        """Store where the user parked it, as the bar goes away."""
+        try:
+            position = self.pos()
+        except RuntimeError:
+            return
+        prefs.set_value(prefs.DRAW_BAR_POS,
+                        f"{position.x()},{position.y()}")
+
+    def hideEvent(self, event):
+        # Hiding is the one moment common to every way this bar goes away:
+        # finish, cancel, and the tool being deactivated underneath it.
+        self.remember_position()
+        super().hideEvent(event)
+
+    def cleanup(self):
+        """Uninstall the drag filter. Must run before teardown.
+
+        A Python event filter left installed on a widget that is being
+        destroyed is still called during its destruction, and if the
+        interpreter has begun finalising there is nothing left to call — the
+        process dies with no traceback. See `WindowDragFilter.detach_all`.
+        """
+        self._drag.detach_all()
+
     def update_info(self, point_count, area_text="", perimeter_text=""):
-        """Update the info label with current stats"""
+        """Update the inline measurements, and what is clickable.
+
+        One line, and short. `area_text` and `perimeter_text` arrive as bare
+        values ("12.4 km\u00b2"); they used to carry "Area: " / "Perimeter: "
+        prefixes and a newline each, which is three of the rows this strip no
+        longer has.
+        """
         if point_count == 0:
-            text = "Click to add points"
+            text = "Click the map to add points"
         elif point_count == 1:
-            text = "1 point\nClick to add more"
+            text = "1 point \u00b7 two more needed"
         elif point_count == 2:
-            text = f"2 points\n{perimeter_text}\nNeed 1 more for polygon"
+            text = "2 points \u00b7 one more needed"
+            if perimeter_text:
+                text += f" \u00b7 {perimeter_text}"
         else:
-            text = f"{point_count} points\n{area_text}\n{perimeter_text}"
+            parts = [f"{point_count} points"]
+            parts.extend(p for p in (area_text, perimeter_text) if p)
+            text = " \u00b7 ".join(parts)
 
         self.info_label.setText(text)
 
@@ -241,10 +279,18 @@ class ModernDrawTool(QgsMapTool):
         self.canvas = canvas
         self._points = []
 
-        # Rubber band for the polygon
+        # Rubber band for the polygon, in the brand accent.
+        #
+        # This was #3B82F6 — a blue that appears nowhere else in the product.
+        # The area being drawn is the most prominent thing on screen while the
+        # tool is live, and it was the one piece of GoPilot's UI that did not
+        # look like GoPilot.
+        t = design.tokens()
         self._rb = QgsRubberBand(canvas, QgsWkbTypes.GeometryType.PolygonGeometry)
-        self._rb.setColor(QColor(59, 130, 246, 60))  # Blue with transparency
-        self._rb.setStrokeColor(QColor(59, 130, 246))
+        # The fill is deliberately weak: it sits over imagery the user is
+        # tracing, and anything heavier hides the feature they are outlining.
+        self._rb.setColor(_with_alpha(t.accent, 55))
+        self._rb.setStrokeColor(QColor(t.accent))
         self._rb.setWidth(3)
         self._rb.setLineStyle(Qt_SolidLine)
 
@@ -288,8 +334,17 @@ class ModernDrawTool(QgsMapTool):
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter_Antialiasing)
 
-        # Draw crosshair
-        pen = QPen(QColor(59, 130, 246))
+        # Draw crosshair, in the accent. A white outline goes under it first
+        # so the cursor stays visible over dark imagery as well as light —
+        # the single-colour version disappeared over water and shadow.
+        accent = QColor(design.tokens().accent)
+        halo = QPen(QColor("#FFFFFF"))
+        halo.setWidth(4)
+        painter.setPen(halo)
+        painter.drawLine(16 - 8, 16, 16 + 8, 16)
+        painter.drawLine(16, 16 - 8, 16, 16 + 8)
+
+        pen = QPen(accent)
         pen.setWidth(2)
         painter.setPen(pen)
 
@@ -302,7 +357,7 @@ class ModernDrawTool(QgsMapTool):
         painter.drawLine(center, center - size, center, center + size)
 
         # Center dot
-        painter.setBrush(QBrush(QColor(59, 130, 246)))
+        painter.setBrush(QBrush(accent))
         painter.drawEllipse(center - 2, center - 2, 4, 4)
 
         painter.end()
@@ -311,24 +366,33 @@ class ModernDrawTool(QgsMapTool):
         self.canvas.setCursor(cursor)
 
     def _position_toolbar(self):
-        """Position toolbar in the top-right corner of canvas"""
+        """Put the bar back where the user left it, else top-centre.
+
+        Top CENTRE rather than the old top-right corner: the strip is wide
+        and short now, and the right corner of a QGIS canvas is where the
+        plugin panel is usually docked, so the bar and the panel were
+        stacking up in the same place.
+        """
+        remembered = self._toolbar.remembered_position()
+        if remembered is not None:
+            self._toolbar.move(remembered)
+            return
+
         canvas_rect = self.canvas.rect()
-        toolbar_width = 280
-        toolbar_height = self._toolbar.sizeHint().height()
-
-        x = canvas_rect.width() - toolbar_width - 20
-        y = 20
-
-        # Convert to global coordinates
+        width = self._toolbar.sizeHint().width()
+        margin = self._toolbar.EDGE_MARGIN
+        x = max(margin, (canvas_rect.width() - width) // 2)
         global_pos = self.canvas.mapToGlobal(canvas_rect.topLeft())
-        self._toolbar.move(global_pos.x() + x, global_pos.y() + y)
+        self._toolbar.move(global_pos.x() + x, global_pos.y() + margin)
 
     def _add_vertex_marker(self, point):
         """Add an enhanced vertex marker at the given point"""
         marker = QgsVertexMarker(self.canvas)
         marker.setCenter(point)
-        marker.setColor(QColor(59, 130, 246))
-        marker.setFillColor(QColor(255, 255, 255))
+        # Accent ring, white centre: the white is what keeps a vertex
+        # findable over dark imagery, the ring is what makes it ours.
+        marker.setColor(QColor(design.tokens().accent))
+        marker.setFillColor(QColor("#FFFFFF"))
         marker.setIconSize(12)
         marker.setIconType(QgsVertexMarker.IconType.ICON_CIRCLE)
         marker.setPenWidth(3)
@@ -358,7 +422,7 @@ class ModernDrawTool(QgsMapTool):
                     self._points[i], self._points[i + 1]
                 )
 
-        perimeter_text = f"Perimeter: {self._format_distance(perimeter)}"
+        perimeter_text = self._format_distance(perimeter)
 
         # Calculate area if we have at least 3 points
         area_text = ""
@@ -367,7 +431,7 @@ class ModernDrawTool(QgsMapTool):
             closed_points = self._points + [self._points[0]]
             geom = QgsGeometry.fromPolygonXY([closed_points])
             area = self._distance_area.measureArea(geom)
-            area_text = f"Area: {self._format_area(area)}"
+            area_text = self._format_area(area)
 
         self._toolbar.update_info(len(self._points), area_text, perimeter_text)
 
@@ -508,6 +572,12 @@ class ModernDrawTool(QgsMapTool):
 
         if self._toolbar:
             try:
+                # cleanup() BEFORE close(): it saves the parked position and
+                # takes the drag filter off its handles. A Python event
+                # filter still installed on a widget being destroyed is
+                # called during that destruction, which kills the process
+                # outright if the interpreter is already finalising.
+                self._toolbar.cleanup()
                 self._toolbar.close()
                 self._toolbar.deleteLater()
             except RuntimeError:
